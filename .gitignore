@@ -1,0 +1,42 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.db
+*.db-shm
+*.db-wal
+*.opendb
+*.VC.opendb
+*.vcxproj.user
+*.sln.docstates
+
+# Build outputs
+Debug/
+Release/
+x64/
+x86/
+[Ww]in32/
+[Aa]rm/
+[Aa]rm64/
+out/
+build/
+obj/
+bin/
+*.exe
+*.dll
+*.sys
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+*.log
+*.tlog
+
+# IntelliSense / PCH
+ipch/
+*.ipch
+
+# VS Code
+.vscode/
+*.code-workspace
