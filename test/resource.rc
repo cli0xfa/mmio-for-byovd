@@ -1,0 +1,7 @@
+// Embeds WinIo64.sys into the test executable as an RCDATA resource. The path
+// is relative to this .rc file's directory (the test/ folder). At runtime the
+// test extracts the resource, drops it to a temp .sys, and registers it as a
+// kernel-driver service -- see main.cpp.
+#include "resource.h"
+
+IDR_WINIO_BIN RCDATA "WinIo.sys"

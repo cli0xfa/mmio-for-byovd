@@ -4,4 +4,5 @@
     <Platform Name="x86" />
   </Configurations>
   <Project Path="mmio-for-byovd/mmio-for-byovd.vcxproj" Id="e96b508d-b2d9-4dee-8f25-c218a9dfaefe" />
+  <Project Path="test/test.vcxproj" Id="7ae28716-568e-495a-b00f-1f3a573fb892" />
 </Solution>

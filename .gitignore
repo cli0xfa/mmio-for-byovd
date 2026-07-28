@@ -25,6 +25,8 @@ bin/
 *.exe
 *.dll
 *.sys
+# keep the embedded test driver payload tracked:
+!test/WinIo.sys
 *.pdb
 *.ilk
 *.exp
