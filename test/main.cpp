@@ -255,8 +255,12 @@ static void TestBadCallbacks()
 	else
 		Fail("Initialize rejects null callbacks");
 
-	// Direct VA translation with no callbacks must also fail safely.
-	if (m.VaToPa(0xFFFF800000000000ull, 0) == 0
+	// Direct VA translation with no callbacks must also fail safely. Pass a
+	// NON-ZERO cr3pa so VaToPa skips its "no CR3 cached" early-out (the lib
+	// checks CR3 availability *before* callback validity) and actually reaches
+	// the CallbacksValid() guard — otherwise a cr3pa=0 call with no cached
+	// system_cr3pa_ returns TranslationFailed, not BadCallbacks.
+	if (m.VaToPa(0xFFFF800000000000ull, /*cr3pa=*/1) == 0
 		&& m.last_status() == MmioStatus::BadCallbacks)
 		Pass("VaToPa rejects no callbacks");
 	else
