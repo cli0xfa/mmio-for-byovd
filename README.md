@@ -1,36 +1,35 @@
 # mmio-for-byovd
 
-一个 **header-only** 的物理内存映射辅助库（仅头文件 `mmio.hpp`），用于在指定一个「把物理页映射到当前进程虚拟地址空间」的回调对（`FnMap` / `FnUnMap`）之后，完成 NT 内核镜像基址定位、System CR3 值扫描、内核虚拟地址到物理地址的页表遍历，以及跨页安全的内核内存读写。
+一个 **header-only** 的物理内存映射辅助库（仅 `mmio.hpp`）。提供「把脆弱驱动的物理内存映射能力包装为内核 VA 读写、页表翻译、System CR3 定位」的通用封装。
 
-库适用于 **BYOVD（Bring Your Own Vulnerable Driver）** 类工具链：调用方自行负责加载一个具备物理内存映射能力的（通常是已签名但有缺陷的）内核驱动，并把该驱动的「map 一个物理页」接口实现为 `FnMap` / `FnUnMap` 两个回调传给库；本库仅在此基础上提供页表解析、内核定位与读写封装。
+**一句话**：你提供 `FnMap`/`FnUnMap`（映射/取消映射物理页的回调），这个库帮你完成剩下的内核内存访问工作。
 
-> **使用前提**：管理员权限 + 一个可正常工作的物理内存映射回调。本库本身不含驱动加载逻辑，不提供任何镜像或漏洞利用，仅做内存解析封装。
->
-> **用途限定**：仅供合法安全研究、漏洞分析、固件/驱动调试等受控环境使用。请勿用于未授权目标。
+---
+
+## 这个库有什么用
+
+BYOVD（Bring Your Own Vulnerable Driver）场景下，你加载了一个有物理内存映射能力的驱动，但驱动通常只暴露最原始的 IOCTL——把某个物理页映射到用户态虚拟地址。在此之上你还需要：
+
+- 定位 **ntoskrnl.exe** 基址
+- 扫描物理内存找到 **System 进程的 CR3**（页表基址）
+- 用该 CR3 把**内核虚拟地址翻译为物理地址**（走页表遍历，支持 4/5 级分页、2 MB/1 GB 大页）
+- 在翻译好的地址上**安全地读写内核内存**（自动处理跨页分段、SEH 容错）
+
+这些是每个 BYOVD 工具都要重复写的样板代码，`mmio.hpp` 把它们打包成一个头文件，你只需实现两个回调：
+
+```cpp
+FnMap  = std::function<bool(uint64_t pa, uintptr_t* outVa, size_t size)>
+FnUnMap = std::function<void(uintptr_t va)>
+```
 
 ---
 
 ## 平台要求
 
-- 仅支持 **x86-64** 的 Windows 10 / 11（及对应 Server 版本）。库内部所有 VA / PA 推导按 64 位进行，在 32 位下不可用。
-- 编译器：MSVC（项目 `mmio-for-byovd.vcxproj` 使用 v145 工具集、C++20 / `stdcpplatest`）。
-- SDK：`windows.h`、`psapi.h`（链接 `psapi.lib`）、`intrin.h`（`__cpuidex`），无第三方依赖。
-- 已验证配置：`Debug|x64`、`Release|x64`。Win32 配置在工程文件中仅作为兼容项保留，库本身在 32 位下不具备可用性。
-
----
-
-## 文件结构
-
-```
-mmio-for-byovd/
-├── README.md                 本文件
-├── mmio-for-byovd.slnx       Visual Studio 解决方案
-└── mmio-for-byovd/
-    ├── mmio.hpp              唯一头文件，包含全部实现
-    └── mmio-for-byovd.vcxproj  样例工程（App 类型，无 main，仅用于承载本头）
-```
-
-`mmio.hpp` 是唯一对外暴露的接口来源；整个库为 inline 实现，直接 `#include "mmio.hpp"` 即可使用，无需单独编译产物。
+- **仅 x86-64** Windows 10 / 11（及 Server 版本）
+- MSVC（C++20+），`/EHsc`
+- 依赖：`windows.h`、`psapi.h`、`intrin.h`，无第三方库
+- 需要**管理员权限** + 一个能映射物理内存的驱动
 
 ---
 
@@ -39,11 +38,9 @@ mmio-for-byovd/
 ```cpp
 #include "mmio.hpp"
 
-// 例：用一个已加载的脆弱驱动的接口实现 map/unmap 回调
+// 你自己实现的物理页映射回调
 static bool MyMap(uint64_t pa, uintptr_t* outVa, size_t size)
 {
-    // 调用你自己的驱动 IOCTL：把物理页 [pa, pa+size) 映射进本进程
-    // 成功时把映射基址写入 *outVa 并返回 true
     return Driver_MapPhysical(pa, size, outVa);
 }
 static void MyUnmap(uintptr_t va)
@@ -53,215 +50,82 @@ static void MyUnmap(uintptr_t va)
 
 int main()
 {
-    HANDLE hDriver = CreateFileW(L"\\\\.\\YourDriver", GENERIC_READ | GENERIC_WRITE,
-                                0, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE hDriver = CreateFileW(L"\\\\.\\YourDriver", ...);
 
     Mmio mmio(hDriver, MyMap, MyUnmap);
 
     if (!mmio.Initialize()) {
-        printf("init failed: status=%d  GetLastError=%lu\n",
+        printf("init failed: status=%d  err=%lu\n",
                (int)mmio.last_status(), mmio.last_error());
         return 1;
     }
 
-    uint64_t kbase = mmio.kernel_base();
-    printf("ntoskrnl base = 0x%llx, System CR3 = 0x%llx\n",
-           (unsigned long long)kbase, (unsigned long long)mmio.system_cr3pa());
+    printf("ntoskrnl  = 0x%llx\n", mmio.kernel_base());
+    printf("System CR3 = 0x%llx\n", mmio.system_cr3pa());
 
-    // 读 2 字节校验 "MZ"
     uint16_t mz = 0;
-    if (mmio.ReadKernelMemory(kbase, &mz, sizeof(mz)))
-        printf("kernel magic = 0x%04X (MZ=%u)\n", mz, mz == 0x5A4D);
-
-    // 任意跨页读取由库自动分段
-    uint8_t buf[0x10];
-    mmio.ReadKernelMemory(kbase + 0x1000 - 4, buf, sizeof(buf));
+    mmio.ReadKernelMemory(mmio.kernel_base(), &mz, 2);
+    printf("MZ = %s\n", mz == 0x5A4D ? "OK" : "FAIL");
 
     return 0;
 }
 ```
 
-> 关于回调实现的更严格契约见下文「回调契约」一节。
-
 ---
 
-## API 参考
-
-### 类型别名
-
-```cpp
-using FnMap     = std::function<bool(uint64_t pa, uintptr_t* outVa, size_t size)>;
-using FnUnMap   = std::function<void(uintptr_t va)>;
-using FnProgress = std::function<bool(uint64_t scannedPa)>;
-```
-
-| 类型 | 含义 |
-|---|---|
-| `FnMap` | 把物理地址 `pa` 起 `size` 字节映射到本进程，成功时写入 `*outVa` 并返回 `true` |
-| `FnUnMap` | 释放 `FnMap` 返回的 `va`；无返回值 |
-| `FnProgress` | `FindSystemCr3` 扫描进度/取消回调；收到当前扫描物理地址，返回 `false` 取消扫描 |
+## API
 
 ### 状态枚举
 
-```cpp
-enum class MmioStatus {
-    Ok,               // 成功
-    BadCallbacks,     // 传入的 FnMap / FnUnMap 为空 std::function
-    NoKernelBase,     // EnumDeviceDrivers 未能取得内核镜像基址
-    NoSystemCr3,      // 物理扫描未找到 System CR3
-    MappingFailed,    // FnMap 拒绝/未能产生可用映射
-    TranslationFailed,// VaToPa 翻译失败（非规范地址 / PTE 不在场 / PTE 读取失败）
-    NoSeDebugPrivilege,// SeDebugPrivilege 无法启用（Win11 24H2+ 所需）
-    Cancelled,        // FindSystemCr3 经 progress 回调被调用方取消
-    InternalError,    // 其余意外低层失败（如经 SEH 捕获的访问违例 / 非法参数）
-};
-```
+| 值 | 含义 |
+|---|---|
+| `Ok` | 成功 |
+| `BadCallbacks` | `FnMap`/`FnUnMap` 为空 |
+| `NoKernelBase` | 未能取得内核基址 |
+| `NoSystemCr3` | 物理扫描未找到 System CR3 |
+| `MappingFailed` | 回调拒绝映射 |
+| `TranslationFailed` | VA→PA 翻译失败 |
+| `NoSeDebugPrivilege` | 无法启用 SeDebugPrivilege（Win11 24H2+） |
+| `Cancelled` | 扫描被 progress 回调取消 |
+| `InternalError` | 其他底层失败 |
 
-### `class Mmio`
-
-```cpp
-Mmio(HANDLE h, FnMap fm, FnUnMap fu);
-```
-- 构造时缓存设备句柄与回调。`h` 仅在析构时 `CloseHandle`，留作子类/消费方后续做 IOCTL 直连用；传 `nullptr` 表示不持有句柄。
-- **不可拷贝**，**可移动**（move 后源对象的句柄置 `INVALID_HANDLE_VALUE`、缓存清零，避免双重关闭）。
-
-#### 初始化与诊断
+### 核心方法
 
 | 方法 | 说明 |
 |---|---|
-| `[[nodiscard]] bool Initialize()` | 一次性初始化：取内核基址 + 扫描 System CR3。成功后 `kernel_base()` / `system_cr3pa()` 可用。任何失败返回 `false`，配合 `last_status()` / `last_error()` 排障 |
-| `MmioStatus last_status() const` | **最近一次** `Initialize` / `Read*` / `Write*` / `VaToPa` / `GetKernelBase` / `FindSystemCr3` 的结果分类。任一公开操作在入口将状态置 `Ok`，成功保持 `Ok`，失败写入对应分类（`BadCallbacks` / `NoKernelBase` / `NoSystemCr3` / `MappingFailed` / `TranslationFailed` / `NoSeDebugPrivilege` / `InternalError`） |
-| `DWORD last_error() const` | 最近的底层 `GetLastError()` 值（例如 `EnumDeviceDrivers` 失败时记录）；纯翻译/映射类失败不设该值 |
+| `Initialize()` | 一次性初始化：定位内核基址 + 扫描 System CR3 |
+| `VaToPa(va, cr3pa=0)` | 内核 VA → 物理地址翻译（默认用缓存的 System CR3） |
+| `ReadKernelMemory(va, buf, size)` | 安全读内核内存（自动跨页分段） |
+| `WriteKernelMemory(va, buf, size)` | 安全写内核内存（自动跨页分段） |
+| `ReadPhysicalMemory(pa, buf, size)` | 直接读物理内存（单次最多跨一页边界） |
+| `WritePhysicalMemory(pa, buf, size)` | 直接写物理内存 |
+| `GetKernelBase()` | 通过 `EnumDeviceDrivers` 获取 NT 内核基址 |
+| `FindSystemCr3(progress)` | 扫描物理内存定位 System CR3 |
+| `kernel_base()` | 缓存的内核基址（`Initialize()` 后可用） |
+| `system_cr3pa()` | 缓存的 System CR3（`Initialize()` 后可用） |
+| `last_status()` | 最近一次操作的状态 |
+| `last_error()` | 最近一次 `GetLastError()` 值 |
 
-#### 物理内存访问
+### 回调契约
 
-| 方法 | 说明 |
-|---|---|
-| `[[nodiscard]] bool ReadPhysicalMemory(uint64_t pa, void* buf, size_t size)` | 读物理地址 `pa` 起 `size` 字节到 `buf`。**约束：`pageOffset(pa&0xFFF) + size ≤ 0x2000`**（单次映射最多跨一页边界）。跨页请用 `ReadKernelMemory` |
-| `[[nodiscard]] bool WritePhysicalMemory(uint64_t pa, const void* buf, size_t size)` | 对应写接口，约束同上 |
-
-入口校验：
-- `size == 0` → 直接返回 `true`；
-- `buf == nullptr`（且 `size>0`）→ 返回 `false` 并置 `last_status_ = InternalError`；
-- 单段 `pageOffset+size > 0x2000` → 返回 `false`（交由上层 `Read/WriteKernelMemory` 分段）。
-
-#### 内核内存访问（自动按 4 KB 分段）
-
-| 方法 | 说明 |
-|---|---|
-| `[[nodiscard]] bool ReadKernelMemory(uint64_t va, void* buf, size_t size)` | 读内核虚拟地址 `va` 起 `size` 字节。内部按页边界分段，每段单独 `VaToPa` 翻译并调用 `ReadPhysicalMemory`；任意段失败整体返回 `false` |
-| `[[nodiscard]] bool WriteKernelMemory(uint64_t va, const void* buf, size_t size)` | 对应写接口 |
-
-可安全处理：跨页、跨多个 4 KB 边界的大块读写。注意 `buf` 可写性由调用方保证。
-
-#### 地址翻译与定位
-
-| 方法 | 说明 |
-|---|---|
-| `uint64_t VaToPa(uint64_t va, uint64_t cr3pa = 0)` | 把内核 VA 翻译为 PA。`cr3pa==0` 时使用 `Initialize()` 缓存的系统 CR3。返回 `0` 表示失败（非规范地址 / PTE not-present / 映射读失败） |
-| `uint64_t GetKernelBase()` | 通过 `EnumDeviceDrivers` 取 NT 内核镜像基址：逐项调用 `GetDeviceDriverBaseNameW`，按基名比对 `ntoskrnl.exe`/`ntkrnlmp.exe`/`ntkrnlpa.exe`/`ntkrpamp.exe` 取首个匹配（`EnumDeviceDrivers` 未文档化数组顺序，不可假设首项即内核——见 OSR NTDEV）；未匹配再回退到枚举首项作为兜底。含最多 3 次 `ERROR_INSUFFICIENT_BUFFER` 重试。自 Windows 11 24H2 起，该 API 要求 `SeDebugPrivilege`；库在 `Initialize()` 入口会自动尝试启用 |
-| `uint64_t FindSystemCr3(FnProgress progress = nullptr)` | 扫描物理内存定位 System 进程 CR3。`progress` 可选取消回调，每扫一个 2 MB 窗口调用一次；返回 `false` 即取消扫描，此时 `last_status()` 置为 `Cancelled` |
-| `uint64_t kernel_base()  const` | 缓存的内核基址（`Initialize()` 后可用） |
-| `uint64_t system_cr3pa() const` | 缓存的 System CR3 物理地址（`Initialize()` 后可用） |
+- **FnMap**(pa, &outVa, size)：把物理页 `[pa, pa+size)` 映射到用户态虚拟地址，成功置 `*outVa` 返回 `true`。size 常见取值 `0x1000`、`0x2000`、`0x200000`。回调内**不应抛异常**。
+- **FnUnMap**(va)：释放 `FnMap` 返回的映射。
+- 回调需要可重入（`VaToPa` 遍历中会反复调用）。
 
 ---
 
-## 内部行为说明
+## 集成到你的工程
 
-### 分页模式判定（LA57）
-- **不再依赖 CPUID 能力位 `CPUID(7,0):ECX[16]`**。该位只表明 CPU *支持* 5 级分页；现代 Intel（Alder Lake+）/ AMD（Zen4+）在 BIOS/OS 仍用 4 级分页时该位常被置位，旧实现据此会让 `VaToPa` 多走一层 PML5 而全程错乱。运行时模式应由实际启用信号决定，与 Linux 内核区分 `X86_FEATURE_LA57`（硬件能力）/ `X86_FEATURE_5LEVEL_PAGING`（运行时模式）的做法一致。
-- **判定源是缓存的内核镜像基址 `kernelbase_`**，而非被翻译的 VA 本身——分页模式是整个 OS 地址空间的属性，由 OS 自身放置内核镜像的位置给出权威信号：
-  - 4 级规范：`bits[63:47] == 0x1FFFF`（符号扩展自 bit 47），内核半区 `0xFFFF8000_00000000 ~ 0xFFFFFFFF_FFFFFFFF`
-  - 5 级规范：`bits[63:57] == 0x7F` 且 bit 56 置位（符号扩展自 bit 56），内核半区 `0xFF000000_00000000 ~ 0xFFFFFFFF_FFFFFFFF`
-  - **4 级内核半区是 5 级内核半区的子集**，所以单个高半 VA 不足以区分二者；改用 `kernelbase_` 这一 ``OS 选择性``信号可避免对被翻译 VA 的误判。
-- 适用范围：
-  - **4 级 OS**（`kernelbase_` 在公共高半区，Windows 默认）→ 4 级遍历；
-  - **5 级 OS 且 `kernelbase_` 落在 5 级专属区间** `[0xFF000000_00000000, 0xFFFF7FFF_FFFFFFFF]`（LA57 自然的内核半区）→ 5 级遍历；
-  - **5 级 OS 但 `kernelbase_` 仍留在 4 级兼容公共高半区** 不被自动识别（当前所有 shipping Windows 均非此情形）。此处刻意不进行 ``反向重试``，因为在 4 级 OS 下 `cr3pa` 指向的是 PML4 表，重试 5 级遍历可能静默返回错误的 PA 而非失败。
-- 因此在「CPU 支持 LA57 但 OS 用 4 级」的常见机器上 `Initialize()` 不再必败。`kernelbase_` 未缓存时（如直接调 `VaToPa(va, cr3pa!=0)`）默认按 4 级处理。
-
-### 大页翻译
-- 大页叶节点（PTE 的 PS 位置位）只在 **PDPT（1 GB）** 与 **PD（2 MB）** 层出现，对应遍历索引 `i==2` 与 `i==3`。
-- **PML5（i==0）与 PML4（i==1）层的 PS 位均为保留位**，置位时按指向下一级页目录指针继续向下遍历（Intel SDM / 5-Level Paging 白皮书均要求忽略该保留位）；旧实现误把 `i==1` 当 1 GB、漏掉 `i==3` 的 2 MB 大页。
-- 旧实现把 `i==1` 当 1 GB、`i==2` 当 2 MB、漏掉 `i==3` 的 2 MB 大页，导致在用 2 MB 大页映射 `.text/.data` 的真实 `ntoskrnl` 上 `VaToPa` 返回错误 PA，进而 `FindSystemCr3` 校验 "MZ" 永远失败 → `Initialize()` 必返 `false`。此问题已修复。
-
-### 物理地址位宽
-- `PADDR_MASK` 由 `CPUID 0x80000008:EAX[7:0]`（MAXPHYADDR，通常 48 / 52）运行时计算并缓存，不再硬编码 52 位；规避了服务器 57 位 PA 等场景的截断风险。
-- **先校验扩展 CPUID 范围存在**：先查 `CPUID 0x80000000:EAX` 获取最大扩展 leaf，确认 `>= 0x80000008` 且高位为 `0x80000000` 才再查 `0x80000008`（沿用 Linux KVM 对 `CPUID(0x80000000)` 的清洗做法）。legacy/被过滤 CPU 上该查询可能无声复现上一个标准 leaf 输出而给出垃圾值；命中此分支时回退 52 位（架构最大 PA 位宽），因 PTE 中超过 MAXPHYADDR 的保留位由硬件/OS 保证为 0，更宽的 mask 仍能得到正确的 PTE 推导 PA，不会截断真机上常超过 64 GB 的物理内存。
-
-### CR3 扫描
-- 以 2 MB 为扫描窗口；若 `FnMap` 拒绝 2 MB 映射，自动**回退到逐 4 KB** 粒度继续命中候选（旧实现整段 `continue` 直接跳过，对仅支持页粒度的回调会漏掉真实 CR3）。
-- 启发式：候选页须满足其**顶级页表「高半项」的存在位为 1**、且能经此 CR3 把 `kernelbase_` 翻译出有效 PA；再读其首字节校验 "MZ"。高半项随分页模式不同（模式由 `kernelbase_` 判定，见「分页模式判定」）：4 级为 `PML4[511].P=1`（偏移 `0xFF8`），5 级为 `PML5[1].P=1`（偏移 `0x8`）；旧实现固定查 `PML4[511]`，在 5 级 OS 上真 System CR3 可能因 `PML4[511].P=0` 被错误过滤而永远扫不到。**二次校验**：解析 `e_lfanew` 并经同一 CR3 翻译 PE 头偏移，验证 `IMAGE_NT_HEADERS.Signature == "PE\0\0"`（`0x00004550`），显著降低假阳率。
-- 全部裸内存访问收敛到唯一 `SehCopy` 叶子函数，使用 `__try/__except` 兜底；映射由 RAII 守卫 `ScopedMap` 管理，异常路径不泄漏。`ScopedMap` 析构声明为 `noexcept` 并在内部 `try/catch(...)` 吞掉回调可能抛出的 C++ 异常——回调按契约应为不抛，此为防御性兑底，避免在栈展开期间触发 `std::terminate`。
-
-### 异常 / 资源安全
-- 全库仅 `SehCopy` 一个函数使用 `__try/__except`，其帧内无任何带析构的 C++ 对象——这是 MSVC `/EHsc` 下合法混用 SEH 的硬性要求（否则触发 `C2712`）。所有上层封装经 `ScopedMap` 守卫映射，再委托 `SehCopy` 完成原始 `memcpy`，折中兼顾 SEH 容错与 C++ 异常安全。
-- 空 `std::function` 回调在入口即被 `CallbacksValid()` 拒绝并返回 `BadCallbacks`，避免 `std::bad_function_call` 在 `/EHsc` 下终止进程。
-
----
-
-## 回调契约（`FnMap` / `FnUnMap`）
-
-由调用方提供，必须满足：
-
-- `FnMap(pa, &outVa, size)`：
-  - `size` 是「期望映射大小」，常见取值 `0x1000`（单页）、`0x2000`（跨一页边界）、`0x200000`（2 MB 扫描窗）。
-  - 成功后 `*outVa` 必须为可读写的用户态虚拟地址，覆盖 `[outVa, outVa + size)`。
-  - 失败返回 `false`（合法；`FindSystemCr3` 会在 2 MB 失败时回退到 4 KB）。
-  - 回调内部**不应抛 C++ 异常**；若抛出，`ScopedMap` 仍会保证 unmapped，但调用方需自行保证不依赖异常机制。
-- `FnUnMap(va)`：
-  - 必须能释放 `FnMap` 返回的任意 `va`，且可被重复场景中确保一一对应。
-- 可重入性：`VaToPa` 在遍历中会反复调用 `FnMap` / `FnUnMap`（每次读一个 PTE 映射一次页），实现需无状态或自带锁。
-
----
-
-## 已知限制
-
-- **Windows 11 24H2+**：`EnumDeviceDrivers` 需 `SeDebugPrivilege` 才能返回有效内核基址。`Initialize()` 会自动尝试启用该特权（最佳努力），失败时 `last_status()` 可能为 `NoKernelBase` 且 `last_error()` 为 `ERROR_PRIVILEGE_NOT_HELD`（1314）。
-- **LA57 自动识别受限**：仅当缓存的 `kernelbase_` 落在 5 级专属内核半区 `[0xFF000000_00000000, 0xFFFF7FFF_FFFFFFFF]` 时判定为 5 级分页。若某 OS 实际启用 5 级却把内核镜像仍留在 4 级兼容公共高半区，则不会被自动识别（当前所有发布版 Windows 均非此情形）。用户态无直接读 `CR4.LA57` 能力，故采用 `kernelbase_` 这种 OS 选择性消费信号。
-- **仅 x64**：32 位下不可用（工程含 Win32 配置仅为 IDE 兼容）。
-- **非线程安全**：`last_status_` / `last_error_` 以及缓存 `kernelbase_` / `system_cr3pa_` 在读路径被并发访问，无内部同步。同一 `Mmio` 实例的多线程并发调用需调用方加锁；跨实例无共享状态。`PaddrMask()` 的静态缓存是线程安全的（函数局部 static 初始化）。
-- `Read/WritePhysicalMemory` 单次最多覆盖一页边界（`pageOffset+size ≤ 0x2000`）；更大或跨多页请求须经 `Read/WriteKernelMemory`。
-- `VaToPa` / `Read*` / `Write*` 未标记 `const` / `noexcept`：它们确有可观察副作用（写 `last_status_` / `last_error_`），且回调路径可能抛。如需 const 对象调用，可日后将诊断成员置 `mutable` 再标 const——本次保留原始语义。
-- `hDevice_` 仅在析构时 `CloseHandle`，当前无方法引用，作为「reserved for direct IOCTL usage」保留并注释。
-- 未纳入工程级单测：消费方需按 [验证场景](#验证场景) 自行验证。
-- **SEH/C++ 兼容性需 `/EHsc`**：`SehCopy` 叶子的设计以 MSVC `/EHsc` 为前提（否则触发 `C2712`），工程文件已显式开启 `<ExceptionHandling>Sync</ExceptionHandling>`。若将本头拉入其它工程，须确保该工程亦为 `/EHsc` 而非 `/EHa`，否则 `__try/__except` 与析构混用的保证会被弱化。
-- **安全敏感**：依赖调用方提供物理内存映射能力，使用须遵守所在司法辖区的相关法律与许可授权；作者不承担滥用责任。
-
----
-
-## 验证场景
-
-建议消费方在具备真实 `FnMap` / `FnUnMap` 回调与管理员权限的环境下验证：
-
-1. **4 级 + 2 MB 大页内核**：`Initialize()` 成功；`ReadKernelMemory(kernelbase_, 2)` 读到 `"MZ"`；读 2 MB 大页内部偏移 64 字节与基址处读连续字节拼接一致。
-2. **LA57-capable 但 OS 4 级**（Alder Lake+ / Zen4+ 默认配置）：` VaToPa` 不误走 PML5，`Initialize()` 成功（修复前在此类机器上必败）。
-3. **跨页读**：`ReadKernelMemory(va=页末-4, size=12)` 返回正确拼接字节（修复前错误）。
-4. **空回调**：传入空 `std::function` → `Initialize()` 返回 `false` 且 `last_status()==BadCallbacks`，**不**终止进程。亦需验证直接调用 `ReadKernelMemory` / `WriteKernelMemory` / `VaToPa(va, cr3pa!=0)` 时返回 `false` / `0` 并置 `BadCallbacks`，而非 `std::bad_function_call` 崩溃（此前这些入口未校验）。
-5. **映射异常模拟**：注入会在 map 后中间抛 C++ 异常的 `FnMap`，确认无映射句柄泄漏。特别在 `FindSystemCr3` 内部循环时长逆抛——验证 2 MB chunk 映射经 `chunkGuard`（RAII）被释放，而不会被栈展开跳过。
-6. **CR3 扫描性能**：64 GB 机器下 `FindSystemCr3` 在合理上限内完成；`progress` 返回 `false` 可中途取消；`FnMap` 仅支持 4 KB 粒度时仍能命中（粒度回退路径）。直接调用未命中时 `last_status()==NoSystemCr3`。
-7. **错误诊断**：失败路径下 `last_status()` / `last_error()` 能区分「无内核基址 / 无 CR3 / 回调缺失 / 映射拒绝 / 翻译失败 / SEH 违例」。并验证「最近一次调用」契约：一次失败后再调用成功的 `ReadKernelMemory`，`last_status()` 被重置为 `Ok`（此前会残留旧失败值）。另验证 `FindSystemCr3` 被 `progress` 取消后 `last_status()==Cancelled`（与之前的 `TranslationFailed` 残留区分）。
-8. **`GetKernelBase` 回归**：`EnumDeviceDrivers` 传 `cb=0` 返回 `FALSE`+`ERROR_INSUFFICIENT_BUFFER` 是正常查询路径，`GetKernelBase()` 不再误判为重试而恒返 `0`；`Initialize()` 能实际取得 `kernel_base()`（此前该函数实现死锁于重试，使 `Initialize()` 在所有机器上必然 `NoKernelBase`）。
-
----
-
-## 构建
+1. 把 `mmio.hpp` 加入 include 路径
+2. 链接 `psapi.lib`（已 `#pragma comment(lib, "psapi.lib")`，可用 `#define MMIO_NO_LIB_PRAGMA` 关闭）
+3. 工程需 C++20+ 且 `/EHsc`（已为 SEH 兼容性准备，详见代码注释）
 
 ```bat
-:: 需 Visual Studio 2022（含 v145 工具集）或同版本 Build Tools
 msbuild mmio-for-byovd.slnx /p:Configuration=Release /p:Platform=x64
 ```
 
-若仅需将本库作为头文件集成到自己的工程：
-
-1. 把 `mmio.hpp` 加入消费工程的 `#include` 路径；
-2. 链接 `psapi.lib`（项目已 `#pragma comment(lib, "psapi.lib")`；如需关闭该隐式链接，在包含本头前 `#define MMIO_NO_LIB_PRAGMA`）；
-3. 确保工程启用 C++20 或更高（`stdcpplatest` 已在样例工程验证）。
-
-`/W3` 下应无新增警告。SEH 与 C++ 在 `/EHsc` 下的兼容性已在 `SehCopy` 的设计上提前规避（详见 [内部行为说明](#内部行为说明)）。
-
 ---
 
-## 许可与免责
+## 许可
 
-本代码按「原样」提供，不附带任何明示或默示担保。仅供合法安全研究、漏洞分析、受控环境调试使用。使用者须自行确保遵守所在地区法律法规及目标系统授权范围；作者不对任何滥用后果承担责任。
+MIT License。仅供合法安全研究、漏洞分析、受控环境调试使用。使用者须自行确保遵守所在地法律法规。
