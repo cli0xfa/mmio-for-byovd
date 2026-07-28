@@ -111,6 +111,8 @@ enum class MmioStatus {
     NoSystemCr3,      // 物理扫描未找到 System CR3
     MappingFailed,    // FnMap 拒绝/未能产生可用映射
     TranslationFailed,// VaToPa 翻译失败（非规范地址 / PTE 不在场 / PTE 读取失败）
+    NoSeDebugPrivilege,// SeDebugPrivilege 无法启用（Win11 24H2+ 所需）
+    Cancelled,        // FindSystemCr3 经 progress 回调被调用方取消
     InternalError,    // 其余意外低层失败（如经 SEH 捕获的访问违例 / 非法参数）
 };
 ```
@@ -157,8 +159,8 @@ Mmio(HANDLE h, FnMap fm, FnUnMap fu);
 | 方法 | 说明 |
 |---|---|
 | `uint64_t VaToPa(uint64_t va, uint64_t cr3pa = 0)` | 把内核 VA 翻译为 PA。`cr3pa==0` 时使用 `Initialize()` 缓存的系统 CR3。返回 `0` 表示失败（非规范地址 / PTE not-present / 映射读失败） |
-| `uint64_t GetKernelBase()` | 通过 `EnumDeviceDrivers` 取 NT 内核镜像基址（驱动枚举中的第一项），含最多 3 次 `ERROR_INSUFFICIENT_BUFFER` 重试。自 Windows 11 24H2 起，该 API 要求 `SeDebugPrivilege`；库在 `Initialize()` 入口会自动尝试启用 |
-| `uint64_t FindSystemCr3(FnProgress progress = nullptr)` | 扫描物理内存定位 System 进程 CR3。`progress` 可选取消回调，每扫一个 2 MB 窗口调用一次 |
+| `uint64_t GetKernelBase()` | 通过 `EnumDeviceDrivers` 取 NT 内核镜像基址：逐项调用 `GetDeviceDriverBaseNameW`，按基名比对 `ntoskrnl.exe`/`ntkrnlmp.exe`/`ntkrnlpa.exe`/`ntkrpamp.exe` 取首个匹配（`EnumDeviceDrivers` 未文档化数组顺序，不可假设首项即内核——见 OSR NTDEV）；未匹配再回退到枚举首项作为兜底。含最多 3 次 `ERROR_INSUFFICIENT_BUFFER` 重试。自 Windows 11 24H2 起，该 API 要求 `SeDebugPrivilege`；库在 `Initialize()` 入口会自动尝试启用 |
+| `uint64_t FindSystemCr3(FnProgress progress = nullptr)` | 扫描物理内存定位 System 进程 CR3。`progress` 可选取消回调，每扫一个 2 MB 窗口调用一次；返回 `false` 即取消扫描，此时 `last_status()` 置为 `Cancelled` |
 | `uint64_t kernel_base()  const` | 缓存的内核基址（`Initialize()` 后可用） |
 | `uint64_t system_cr3pa() const` | 缓存的 System CR3 物理地址（`Initialize()` 后可用） |
 
@@ -167,24 +169,30 @@ Mmio(HANDLE h, FnMap fm, FnUnMap fu);
 ## 内部行为说明
 
 ### 分页模式判定（LA57）
-- **不再依赖 CPUID 能力位 `CPUID(7,0):ECX[16]`**。该位只表明 CPU 支持 5 级分页；现代 Intel（Alder Lake+）/ AMD（Zen4+）在 BIOS/OS 仍用 4 级分页时该位常被置位，旧实现据此会让 `VaToPa` 多走一层 PML5 而全程错乱。
-- 改用**运行时内核 VA 规范位姿**判定：
-  - 4 级规范：`bits[63:48] == 0xFFFF`（符号扩展自 bit 47），起始内核半区 `0xFFFF8000_00000000`
-  - 5 级规范：`bits[63:56] == 0xFF` 且 `bits[55:48]` 非全 1（符号扩展自 bit 56），起始 `0xFF000000_00000000`
-- 因此在「CPU 支持 LA57 但 OS 用 4 级」的常见机器上 `Initialize()` 不再必败。
+- **不再依赖 CPUID 能力位 `CPUID(7,0):ECX[16]`**。该位只表明 CPU *支持* 5 级分页；现代 Intel（Alder Lake+）/ AMD（Zen4+）在 BIOS/OS 仍用 4 级分页时该位常被置位，旧实现据此会让 `VaToPa` 多走一层 PML5 而全程错乱。运行时模式应由实际启用信号决定，与 Linux 内核区分 `X86_FEATURE_LA57`（硬件能力）/ `X86_FEATURE_5LEVEL_PAGING`（运行时模式）的做法一致。
+- **判定源是缓存的内核镜像基址 `kernelbase_`**，而非被翻译的 VA 本身——分页模式是整个 OS 地址空间的属性，由 OS 自身放置内核镜像的位置给出权威信号：
+  - 4 级规范：`bits[63:47] == 0x1FFFF`（符号扩展自 bit 47），内核半区 `0xFFFF8000_00000000 ~ 0xFFFFFFFF_FFFFFFFF`
+  - 5 级规范：`bits[63:57] == 0x7F` 且 bit 56 置位（符号扩展自 bit 56），内核半区 `0xFF000000_00000000 ~ 0xFFFFFFFF_FFFFFFFF`
+  - **4 级内核半区是 5 级内核半区的子集**，所以单个高半 VA 不足以区分二者；改用 `kernelbase_` 这一 ``OS 选择性``信号可避免对被翻译 VA 的误判。
+- 适用范围：
+  - **4 级 OS**（`kernelbase_` 在公共高半区，Windows 默认）→ 4 级遍历；
+  - **5 级 OS 且 `kernelbase_` 落在 5 级专属区间** `[0xFF000000_00000000, 0xFFFF7FFF_FFFFFFFF]`（LA57 自然的内核半区）→ 5 级遍历；
+  - **5 级 OS 但 `kernelbase_` 仍留在 4 级兼容公共高半区** 不被自动识别（当前所有 shipping Windows 均非此情形）。此处刻意不进行 ``反向重试``，因为在 4 级 OS 下 `cr3pa` 指向的是 PML4 表，重试 5 级遍历可能静默返回错误的 PA 而非失败。
+- 因此在「CPU 支持 LA57 但 OS 用 4 级」的常见机器上 `Initialize()` 不再必败。`kernelbase_` 未缓存时（如直接调 `VaToPa(va, cr3pa!=0)`）默认按 4 级处理。
 
 ### 大页翻译
 - 大页叶节点（PTE 的 PS 位置位）只在 **PDPT（1 GB）** 与 **PD（2 MB）** 层出现，对应遍历索引 `i==2` 与 `i==3`。
-- **PML4（i==1）层的 PS 位为保留位**，不再误判为 1 GB 叶节点；置位时按页目录指针继续向下遍历（标准要求忽略该保留位）。
+- **PML5（i==0）与 PML4（i==1）层的 PS 位均为保留位**，置位时按指向下一级页目录指针继续向下遍历（Intel SDM / 5-Level Paging 白皮书均要求忽略该保留位）；旧实现误把 `i==1` 当 1 GB、漏掉 `i==3` 的 2 MB 大页。
 - 旧实现把 `i==1` 当 1 GB、`i==2` 当 2 MB、漏掉 `i==3` 的 2 MB 大页，导致在用 2 MB 大页映射 `.text/.data` 的真实 `ntoskrnl` 上 `VaToPa` 返回错误 PA，进而 `FindSystemCr3` 校验 "MZ" 永远失败 → `Initialize()` 必返 `false`。此问题已修复。
 
 ### 物理地址位宽
 - `PADDR_MASK` 由 `CPUID 0x80000008:EAX[7:0]`（MAXPHYADDR，通常 48 / 52）运行时计算并缓存，不再硬编码 52 位；规避了服务器 57 位 PA 等场景的截断风险。
+- **先校验扩展 CPUID 范围存在**：先查 `CPUID 0x80000000:EAX` 获取最大扩展 leaf，确认 `>= 0x80000008` 且高位为 `0x80000000` 才再查 `0x80000008`（沿用 Linux KVM 对 `CPUID(0x80000000)` 的清洗做法）。legacy/被过滤 CPU 上该查询可能无声复现上一个标准 leaf 输出而给出垃圾值；命中此分支时回退 52 位（架构最大 PA 位宽），因 PTE 中超过 MAXPHYADDR 的保留位由硬件/OS 保证为 0，更宽的 mask 仍能得到正确的 PTE 推导 PA，不会截断真机上常超过 64 GB 的物理内存。
 
 ### CR3 扫描
 - 以 2 MB 为扫描窗口；若 `FnMap` 拒绝 2 MB 映射，自动**回退到逐 4 KB** 粒度继续命中候选（旧实现整段 `continue` 直接跳过，对仅支持页粒度的回调会漏掉真实 CR3）。
-- 启发式：候选页须满足 `PML4[511].P=1` 且能经此 CR3 把 `kernelbase_` 翻译出有效 PA；再读其首字节校验 "MZ"。**新增二次校验**：解析 `e_lfanew` 并经同一 CR3 翻译 PE 头偏移，验证 `IMAGE_NT_HEADERS.Signature == "PE\0\0"`（`0x00004550`），显著降低假阳率。
-- 全部裸内存访问收敛到唯一 `SehCopy` 叶子函数，使用 `__try/__except` 兜底；映射由 RAII 守卫管理，异常路径不泄漏。
+- 启发式：候选页须满足其**顶级页表「高半项」的存在位为 1**、且能经此 CR3 把 `kernelbase_` 翻译出有效 PA；再读其首字节校验 "MZ"。高半项随分页模式不同（模式由 `kernelbase_` 判定，见「分页模式判定」）：4 级为 `PML4[511].P=1`（偏移 `0xFF8`），5 级为 `PML5[1].P=1`（偏移 `0x8`）；旧实现固定查 `PML4[511]`，在 5 级 OS 上真 System CR3 可能因 `PML4[511].P=0` 被错误过滤而永远扫不到。**二次校验**：解析 `e_lfanew` 并经同一 CR3 翻译 PE 头偏移，验证 `IMAGE_NT_HEADERS.Signature == "PE\0\0"`（`0x00004550`），显著降低假阳率。
+- 全部裸内存访问收敛到唯一 `SehCopy` 叶子函数，使用 `__try/__except` 兜底；映射由 RAII 守卫 `ScopedMap` 管理，异常路径不泄漏。`ScopedMap` 析构声明为 `noexcept` 并在内部 `try/catch(...)` 吞掉回调可能抛出的 C++ 异常——回调按契约应为不抛，此为防御性兑底，避免在栈展开期间触发 `std::terminate`。
 
 ### 异常 / 资源安全
 - 全库仅 `SehCopy` 一个函数使用 `__try/__except`，其帧内无任何带析构的 C++ 对象——这是 MSVC `/EHsc` 下合法混用 SEH 的硬性要求（否则触发 `C2712`）。所有上层封装经 `ScopedMap` 守卫映射，再委托 `SehCopy` 完成原始 `memcpy`，折中兼顾 SEH 容错与 C++ 异常安全。
@@ -210,12 +218,14 @@ Mmio(HANDLE h, FnMap fm, FnUnMap fu);
 ## 已知限制
 
 - **Windows 11 24H2+**：`EnumDeviceDrivers` 需 `SeDebugPrivilege` 才能返回有效内核基址。`Initialize()` 会自动尝试启用该特权（最佳努力），失败时 `last_status()` 可能为 `NoKernelBase` 且 `last_error()` 为 `ERROR_PRIVILEGE_NOT_HELD`（1314）。
+- **LA57 自动识别受限**：仅当缓存的 `kernelbase_` 落在 5 级专属内核半区 `[0xFF000000_00000000, 0xFFFF7FFF_FFFFFFFF]` 时判定为 5 级分页。若某 OS 实际启用 5 级却把内核镜像仍留在 4 级兼容公共高半区，则不会被自动识别（当前所有发布版 Windows 均非此情形）。用户态无直接读 `CR4.LA57` 能力，故采用 `kernelbase_` 这种 OS 选择性消费信号。
 - **仅 x64**：32 位下不可用（工程含 Win32 配置仅为 IDE 兼容）。
 - **非线程安全**：`last_status_` / `last_error_` 以及缓存 `kernelbase_` / `system_cr3pa_` 在读路径被并发访问，无内部同步。同一 `Mmio` 实例的多线程并发调用需调用方加锁；跨实例无共享状态。`PaddrMask()` 的静态缓存是线程安全的（函数局部 static 初始化）。
 - `Read/WritePhysicalMemory` 单次最多覆盖一页边界（`pageOffset+size ≤ 0x2000`）；更大或跨多页请求须经 `Read/WriteKernelMemory`。
 - `VaToPa` / `Read*` / `Write*` 未标记 `const` / `noexcept`：它们确有可观察副作用（写 `last_status_` / `last_error_`），且回调路径可能抛。如需 const 对象调用，可日后将诊断成员置 `mutable` 再标 const——本次保留原始语义。
 - `hDevice_` 仅在析构时 `CloseHandle`，当前无方法引用，作为「reserved for direct IOCTL usage」保留并注释。
 - 未纳入工程级单测：消费方需按 [验证场景](#验证场景) 自行验证。
+- **SEH/C++ 兼容性需 `/EHsc`**：`SehCopy` 叶子的设计以 MSVC `/EHsc` 为前提（否则触发 `C2712`），工程文件已显式开启 `<ExceptionHandling>Sync</ExceptionHandling>`。若将本头拉入其它工程，须确保该工程亦为 `/EHsc` 而非 `/EHa`，否则 `__try/__except` 与析构混用的保证会被弱化。
 - **安全敏感**：依赖调用方提供物理内存映射能力，使用须遵守所在司法辖区的相关法律与许可授权；作者不承担滥用责任。
 
 ---
@@ -230,7 +240,7 @@ Mmio(HANDLE h, FnMap fm, FnUnMap fu);
 4. **空回调**：传入空 `std::function` → `Initialize()` 返回 `false` 且 `last_status()==BadCallbacks`，**不**终止进程。亦需验证直接调用 `ReadKernelMemory` / `WriteKernelMemory` / `VaToPa(va, cr3pa!=0)` 时返回 `false` / `0` 并置 `BadCallbacks`，而非 `std::bad_function_call` 崩溃（此前这些入口未校验）。
 5. **映射异常模拟**：注入会在 map 后中间抛 C++ 异常的 `FnMap`，确认无映射句柄泄漏。特别在 `FindSystemCr3` 内部循环时长逆抛——验证 2 MB chunk 映射经 `chunkGuard`（RAII）被释放，而不会被栈展开跳过。
 6. **CR3 扫描性能**：64 GB 机器下 `FindSystemCr3` 在合理上限内完成；`progress` 返回 `false` 可中途取消；`FnMap` 仅支持 4 KB 粒度时仍能命中（粒度回退路径）。直接调用未命中时 `last_status()==NoSystemCr3`。
-7. **错误诊断**：失败路径下 `last_status()` / `last_error()` 能区分「无内核基址 / 无 CR3 / 回调缺失 / 映射拒绝 / 翻译失败 / SEH 违例」。并验证「最近一次调用」契约：一次失败后再调用成功的 `ReadKernelMemory`，`last_status()` 被重置为 `Ok`（此前会残留旧失败值）。
+7. **错误诊断**：失败路径下 `last_status()` / `last_error()` 能区分「无内核基址 / 无 CR3 / 回调缺失 / 映射拒绝 / 翻译失败 / SEH 违例」。并验证「最近一次调用」契约：一次失败后再调用成功的 `ReadKernelMemory`，`last_status()` 被重置为 `Ok`（此前会残留旧失败值）。另验证 `FindSystemCr3` 被 `progress` 取消后 `last_status()==Cancelled`（与之前的 `TranslationFailed` 残留区分）。
 8. **`GetKernelBase` 回归**：`EnumDeviceDrivers` 传 `cb=0` 返回 `FALSE`+`ERROR_INSUFFICIENT_BUFFER` 是正常查询路径，`GetKernelBase()` 不再误判为重试而恒返 `0`；`Initialize()` 能实际取得 `kernel_base()`（此前该函数实现死锁于重试，使 `Initialize()` 在所有机器上必然 `NoKernelBase`）。
 
 ---

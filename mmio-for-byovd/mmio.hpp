@@ -44,6 +44,7 @@ enum class MmioStatus
 	MappingFailed,     // FnMap declined / failed to produce a usable mapping
 	TranslationFailed, // VaToPa could not translate (non-canonical / not-present / PTE read error)
 	NoSeDebugPrivilege,// SeDebugPrivilege could not be enabled (required on Win11 24H2+)
+	Cancelled,         // FindSystemCr3 scan was aborted via the progress callback
 	InternalError,     // unexpected low-level failure (SEH-captured AV / bad arguments)
 };
 
@@ -76,6 +77,8 @@ public:
 		other.hDevice_      = INVALID_HANDLE_VALUE;
 		other.kernelbase_   = 0;
 		other.system_cr3pa_ = 0;
+		other.last_status_  = MmioStatus::Ok;
+		other.last_error_   = 0;
 	}
 	Mmio& operator=(Mmio&& other) noexcept
 	{
@@ -87,8 +90,8 @@ public:
 			system_cr3pa_ = other.system_cr3pa_;   other.system_cr3pa_ = 0;
 			fn_pa_map_   = std::move(other.fn_pa_map_);
 			fn_pa_unmap_ = std::move(other.fn_pa_unmap_);
-			last_status_ = other.last_status_;
-			last_error_  = other.last_error_;
+			last_status_ = other.last_status_;    other.last_status_ = MmioStatus::Ok;
+			last_error_  = other.last_error_;     other.last_error_  = 0;
 		}
 		return *this;
 	}
@@ -153,7 +156,19 @@ private:
 		// from C++20 aggregate-init, so brace-initialization requires a ctor.
 		ScopedMap(const FnUnMap* u, uintptr_t v, bool o) noexcept
 			: unmap(u), va(v), owns(o) {}
-		~ScopedMap() { if (owns && unmap && *unmap) (*unmap)(va); }
+		~ScopedMap() noexcept
+		{
+			if (!owns || !unmap || !*unmap) return;
+			try {
+				(*unmap)(va);
+			} catch (...) {
+				// The unmap callback is documented as non-throwing (see the
+				// callback-contract section of the README). Swallow any stray
+				// exception so RAII unwinding during stack-unwinding does not
+				// trigger std::terminate; the mapping is released best-effort
+				// regardless.
+			}
+		}
 	};
 
 	// Resolves the physical-address mask (MAXPHYADDR) once and caches it.
@@ -161,6 +176,18 @@ private:
 
 	// Returns true iff callbacks are usable.
 	bool CallbacksValid() const { return static_cast<bool>(fn_pa_map_) && static_cast<bool>(fn_pa_unmap_); }
+
+	// Derives the OS paging mode from the cached kernel image base. Paging
+	// mode is a property of the whole OS address space, so the image base the
+	// OS itself placed is the authoritative runtime signal (CPUID(7,0):ECX[16]
+	// only reports CPU capability, not the active mode — see the VaToPa
+	// comment). 4-level canonical kernel half has bits[63:47] == 0x1FFFF
+	// (sign-extended from bit 47); a kernel base outside that is taken to mean
+	// 5-level paging. When kernelbase_ is not yet cached we default to 4-level.
+	bool Is4LevelPaging() const noexcept
+	{
+		return (kernelbase_ != 0) ? ((kernelbase_ >> 47) == 0x1FFFFull) : true;
+	}
 
 	// SEH / exception-safe helpers. SehCopy is the single __try/__except leaf
 	// (no C++ destructors in its frame, as required under MSVC /EHsc); the
@@ -171,7 +198,7 @@ private:
 	                       const FnMap& fm, const FnUnMap& fu);
 	static bool SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfanew,
 	                         const FnMap& fm, const FnUnMap& fu);
-	static bool SehReadPml4e511(const uint8_t* pageBase, uint64_t* out);
+	static bool SehReadHighHalfEntry(const uint8_t* tableBase, size_t entryOff, uint64_t* out);
 
 	// Attempt to enable SeDebugPrivilege (required by EnumDeviceDrivers on
 	// Windows 11 24H2+); returns true on success. Failure is non-fatal on
@@ -232,8 +259,14 @@ inline bool Mmio::SehReadPte(uint64_t ptePa, uint64_t* out,
 inline bool Mmio::SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfanew,
                                const FnMap& fm, const FnUnMap& fu)
 {
+	// The DOS header fields we need (e_magic@0, e_lfanew@0x3C) may straddle a
+	// page boundary when `pa` is not page-aligned (e.g. pa & 0xFFF near 0xFC0
+	// puts base + 0x3C past the end of a single 4 KB mapping). Map a 2-page
+	// window so the read stays covered for any in-page offset; the SEH leaf
+	// still reports any fault as a failure. `pa` is page-aligned in practice
+	// (the kernel image base), but this keeps the helper safe for any input.
 	uintptr_t mapped = 0;
-	if (!fm(pa & ~0xFFFull, &mapped, 0x1000))
+	if (!fm(pa & ~0xFFFull, &mapped, 0x2000))
 		return false;
 
 	ScopedMap guard{ &fu, mapped, true };
@@ -244,11 +277,14 @@ inline bool Mmio::SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfa
 	return SehCopy(outLfanew, base + 0x3C, sizeof(uint32_t));
 }
 
-// PML4[511] presence check for a candidate System CR3.
-// pageBase is already mapped by the caller; this is a pure read helper.
-inline bool Mmio::SehReadPml4e511(const uint8_t* pageBase, uint64_t* out)
+// Reads one 8-byte entry of the candidate top-level paging table (PML4 under
+// 4-level paging, PML5 under 5-level paging). `tableBase` is already mapped by
+// the caller; `entryOff` is the byte offset of the high-half entry to check
+// (PML4[511] => 0x1FF*8 under 4-level; PML5[1] => 1*8 under 5-level). Pure
+// read helper — the SEH leaf reports any fault as a failure.
+inline bool Mmio::SehReadHighHalfEntry(const uint8_t* tableBase, size_t entryOff, uint64_t* out)
 {
-	return SehCopy(out, pageBase + 0x1FF * 8, sizeof(uint64_t));
+	return SehCopy(out, tableBase + entryOff, sizeof(uint64_t));
 }
 
 
@@ -263,6 +299,26 @@ inline uint64_t Mmio::PaddrMask()
 	// the process, so a thread-safe function-local static suffices.
 	static const uint64_t mask = []() -> uint64_t {
 		int cpuInfo[4] = {};
+
+		// Validate that the extended CPUID range exists before querying
+		// 0x80000008. On legacy/filtered CPUs a CPUID(0x80000000) query may
+		// silently echo the last standard leaf instead of returning the max
+		// extended leaf, yielding garbage (see how Linux KVM sanitizes
+		// CPUID(0x80000000)). AMD64 long mode guarantees the leaf, but a
+		// hypervisor — common in BYOVD target VMs — may hide it.
+		__cpuidex(cpuInfo, static_cast<int>(0x80000000), 0);
+		const unsigned int maxExtLeaf = static_cast<unsigned int>(cpuInfo[0]);
+		if ((maxExtLeaf & 0xFFFF0000u) != 0x80000000u ||
+		    maxExtLeaf < 0x80000008u) {
+			// Extended leaves unavailable — fall back to 52 bits (the
+			// architectural maximum PA width). PTE reserved bits above
+			// MAXPHYADDR are zero by hardware/OS convention, so a wider mask
+			// still yields correct PTE-derived physical addresses instead of
+			// truncating real PAs (a 36-bit fallback would clip memory beyond
+			// 64 GB, present on most modern machines).
+			return ((1ull << 52) - 1ull) & ~0xFFFull;
+		}
+
 		__cpuidex(cpuInfo, static_cast<int>(0x80000008), 0);
 		unsigned int maxPaBits = static_cast<unsigned int>(cpuInfo[0] & 0xFFu);
 		if (maxPaBits == 0 || maxPaBits >= 64) maxPaBits = 52; // defensive default
@@ -313,9 +369,16 @@ inline bool Mmio::ReadPhysicalMemory(uint64_t pa, void* buf, size_t size)
 	}
 	if (size == 0)                return true;   // nothing to do
 	if (buf == nullptr)           { last_status_ = MmioStatus::InternalError; return false; }
+	// Bound `size` on its own before forming pageOffset + size. A caller
+	// passing size ≈ SIZE_MAX would otherwise wrap requiredSize to a small
+	// value and bypass the 0x2000 limit below; the SEH leaf would still catch
+	// the fault, but the documented "single mapping window covers the range"
+	// invariant (pageOffset + size ≤ 0x2000) must hold arithmetically, not via
+	// fault tolerance.
+	if (size > 0x2000)            { last_status_ = MmioStatus::InternalError; return false; }
 
 	const uintptr_t pageOffset   = static_cast<uintptr_t>(pa & 0xFFFull);
-	const size_t    requiredSize = pageOffset + size;
+	const size_t    requiredSize = pageOffset + size;   // size ≤ 0x2000 ⇒ no wrap
 	// A single mapping window covers at most one page boundary crossing, i.e.
 	// pageOffset + size must not exceed 0x2000. Larger or multi-page requests
 	// must be segmented by the caller (e.g. ReadKernelMemory).
@@ -351,9 +414,14 @@ inline bool Mmio::WritePhysicalMemory(uint64_t pa, const void* buf, size_t size)
 	}
 	if (size == 0)                return true;
 	if (buf == nullptr)           { last_status_ = MmioStatus::InternalError; return false; }
+	// Bound size on its own first (see ReadPhysicalMemory for the full
+	// rationale): a near-SIZE_MAX request must not wrap requiredSize past the
+	// 0x2000 limit — the single-window invariant holds arithmetically, not
+	// only via the SEH leaf's fault tolerance.
+	if (size > 0x2000)            { last_status_ = MmioStatus::InternalError; return false; }
 
 	const uintptr_t pageOffset   = static_cast<uintptr_t>(pa & 0xFFFull);
-	const size_t    requiredSize = pageOffset + size;
+	const size_t    requiredSize = pageOffset + size;   // size ≤ 0x2000 ⇒ no wrap
 	if (requiredSize > 0x2000) {
 		last_status_ = MmioStatus::InternalError;
 		return false;
@@ -462,21 +530,31 @@ inline uint64_t Mmio::VaToPa(uint64_t va, uint64_t cr3pa)
 	constexpr uint64_t PTE_LARGE_PAGE = (1ull << 7);
 
 	// --- Paging mode detection ---------------------------------------------
-	// Decide whether the OS is actually using 5-level (LA57) paging for THIS
-	// address space. CPUID(7,0):ECX[16] only reports CPU *capability*; many
-	// modern CPUs set it while Windows still runs 4-level paging, so using the
-	// capability bit directly breaks every such machine. We instead judge by
-	// the canonical form of the running kernel's image VA:
-	//   4-level canonical kernel half: bits[63:48] == 0xFFFF (sign-ext bit 47)
-	//   5-level canonical kernel half: bits[63:56] == 0xFF, bits[55:48] not
-	//                                  all ones (sign-extended bit 56)
-	// (A simple '>> 56' test would be non-zero for BOTH layouts since the top
-	//  byte is 0xFF in either case, so the test must inspect bits[55:48].)
-	const uint64_t refVa       = (va >= 0xFFFF800000000000ull) ? va : kernelbase_;
-	// When kernelbase_ is not yet cached and va is a user-mode address,
-	// default to 4-level paging (the Windows default on virtually all
-	// x64 systems, including LA57-capable CPUs running 4-level mode).
-	const bool    looks4Level = (refVa != 0) ? ((refVa >> 48) == 0xFFFFull) : true;
+	// Decide whether the OS is actually using 5-level (LA57) paging for the
+	// current address space. CPUID(7,0):ECX[16] only reports CPU *capability*;
+	// many modern CPUs set it while Windows still runs 4-level paging, so using
+	// the capability bit directly breaks every such machine. We instead judge
+	// by the canonical form of the cached kernel image base — paging mode is
+	// a property of the OS address space, not of any individual VA, so the
+	// image base (which the OS itself placed) is the authoritative signal:
+	//   4-level canonical kernel half: bits[63:47] == 0x1FFFF (sign-extended bit 47)
+	//   5-level canonical kernel half: bits[63:57] == 0x7F with bit 56 set
+	//                                  (sign-extended bit 56); the 4-level
+	//                                  kernel half [0xFFFF_8000_..., 0xFFFF_FFFF_...]
+	//                                  is a *subset* of it, so a high-half VA
+	//                                  alone cannot distinguish the two.
+	// This is correct for:
+	//   * 4-level OS (kernelbase_ in the shared high half) — the Windows default;
+	//   * 5-level OS whose kernel image lives in the 5-level-exclusive region
+	//     [0xFF00_0000_0000_0000, 0xFFFF_7FFF_FFFF_FFFF], the natural LA57
+	//     kernel half.
+	// A 5-level OS that keeps its kernel image in the 4-level-compatible shared
+	// high half is not auto-detected. This matches every shipping Windows
+	// build today and avoids the false-positive risk of retrying the walk under
+	// the other mode on a 4-level OS (cr3pa points at a PML4 table, so a
+	// 5-level walk could silently produce a wrong PA instead of failing).
+	// When kernelbase_ is not yet cached we default to 4-level paging.
+	const bool    looks4Level = Is4LevelPaging();
 	const int     vaBits      = looks4Level ? 48 : 57;
 	const int     startIdx    = looks4Level ? 1 : 0;
 
@@ -523,7 +601,8 @@ inline uint64_t Mmio::VaToPa(uint64_t va, uint64_t cr3pa)
 				const uint64_t pageMask = PADDR_MASK & ~((1ull << 21) - 1);
 				return (pteValue & pageMask) | (va & 0x1FFFFFull);
 			}
-			// PS set at PML4 (i==1) is reserved -> ignore and continue walk.
+			// PS set at PML5 (i==0) or PML4 (i==1) is reserved -> ignore and
+			// continue the walk down to the next level.
 		}
 
 		pagingBase = pteValue & PADDR_MASK;
@@ -607,7 +686,34 @@ inline uint64_t Mmio::GetKernelBase()
 			return 0;
 		}
 
-		// First driver in the enumeration is the NT kernel image.
+		// Identify the NT kernel by its base name rather than assuming index 0
+		// is the kernel. EnumDeviceDrivers does not document the array order
+		// (OSR NTDEV community: "usually placed first, but don't rely on it"),
+		// and a /kernel= boot switch or a future enumeration-order change could
+		// otherwise hand back a wrong driver base and silently break the CR3
+		// scan. GetDeviceDriverBaseNameW returns the file name only (no path),
+		// so we compare it case-insensitively against the known kernel image
+		// names (x64 ships ntoskrnl.exe / ntkrnlmp.exe; the PA variants cover the
+		// 32-bit kernels should this code ever be built for them).
+		static const wchar_t* const kKernelNames[] = {
+			L"ntoskrnl.exe", L"ntkrnlmp.exe",
+			L"ntkrnlpa.exe", L"ntkrpamp.exe"
+		};
+		wchar_t nameBuf[64] = {};
+		for (LPVOID drvBase : drivers) {
+			if (!drvBase) continue;
+			if (GetDeviceDriverBaseNameW(drvBase, nameBuf, 64) == 0) continue;
+			for (const wchar_t* k : kKernelNames) {
+				if (lstrcmpiW(nameBuf, k) == 0)
+					return reinterpret_cast<uint64_t>(drvBase);
+			}
+		}
+
+		// Empirical fallback: on every shipping Windows build the first
+		// enumerated driver is the NT kernel image. Kept as a last resort so a
+		// renamed/new kernel image name we did not list still resolves on
+		// current systems; the PE-signature check in FindSystemCr3 still rejects
+		// a non-kernel base during CR3 validation.
 		return reinterpret_cast<uint64_t>(drivers[0]);
 	}
 	return 0;
@@ -643,8 +749,10 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 	// Start from the first physical page (0x0). Physical page 0 is usually
 	// reserved by firmware, but a CR3 table could theoretically reside there.
 	for (uint64_t pa = 0x0; pa < maxPa; pa += chunkSize) {
-		if (progress && !progress(pa))
-			return 0;   // cancelled
+		if (progress && !progress(pa)) {
+			last_status_ = MmioStatus::Cancelled;   // scan aborted by the caller
+			return 0;
+		}
 
 		uintptr_t chunkVa = 0;
 		const uint8_t* chunkBuf = nullptr;
@@ -687,11 +795,19 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 			// a thrown callback or any early exit still releases the mapping.
 			ScopedMap pg{ &fn_pa_unmap_, pageVa, pageMapped };
 
-			// PML4[511] must be present (maps the higher half).
-			uint64_t pml4e511 = 0;
-			if (!SehReadPml4e511(pageBase, &pml4e511))
+			// The high-half entry of the candidate top-level table must be present.
+			// Under 4-level paging that is PML4[511] (offset 0xFF8); under 5-level
+			// paging the kernel half is covered by PML5[1] (offset 0x8), and a
+			// kernel base in the 5-level-exclusive region may have PML4[511].P == 0
+			// — so checking PML4[511] unconditionally (as the previous code did)
+			// would discard the real System CR3 on a 5-level OS. The mode is derived
+			// from the cached kernel base via Is4LevelPaging().
+			const bool   cr3Looks4Level = Is4LevelPaging();
+			const size_t hiEntryOff     = cr3Looks4Level ? (0x1FF * 8) : (1 * 8);
+			uint64_t     hiEntry        = 0;
+			if (!SehReadHighHalfEntry(pageBase, hiEntryOff, &hiEntry))
 				continue;
-			if (!(pml4e511 & 1))
+			if (!(hiEntry & 1))
 				continue;
 
 			// Translate the kernel base through this candidate CR3.
@@ -709,7 +825,11 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 
 			// Secondary validation: the NT image headers must carry "PE\0\0".
 			// e_lfanew is the offset of the PE header from the image base.
-			if (lfanew == 0 || lfanew > 0x400)   // sanity bound for a DOS stub
+			// 0x400 is an empirical upper bound for an ntoskrnl DOS stub, not a
+			// PE-spec-mandated limit; the PE-signature check below is what
+			// actually rejects mismatches -- this bound only filters obviously
+			// bogus offsets cheaply.
+			if (lfanew == 0 || lfanew > 0x400)
 				continue;
 
 			const uint64_t peHdrPa = VaToPa(kernelbase_ + lfanew, cr3Candidate);
@@ -727,8 +847,10 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 			break;
 		}
 
-		if (found)
+		if (found) {
+			last_status_ = MmioStatus::Ok;   // a sub-call may have left a stale status
 			return resultCr3;   // chunkGuard unmaps the 2 MB chunk on return/unwind
+		}
 	}
 
 	last_status_ = MmioStatus::NoSystemCr3;   // scan exhausted without a match
