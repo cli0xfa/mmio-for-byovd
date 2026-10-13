@@ -1,7 +1,7 @@
 // ============================================================================
 // mmio-for-byovd  —  header-only x64 Windows kernel memory access helper.
 //
-// Provides System CR3 scanning, LA57-aware VA->PA paging-table walk, and
+// Provides kernel-mapping CR3 scanning, LA57-aware VA->PA paging-table walk, and
 // cross-page-safe kernel read/write on top of a caller-supplied pair of
 // physical map / unmap callbacks (the BYOVD model: you load the vulnerable
 // driver, this header does the rest).
@@ -73,7 +73,7 @@
 // FnUnMap: callback to release a previously mapped range
 //   va     – virtual address returned by FnMap
 //
-// FnProgress (optional, used by FindSystemCr3):
+// FnProgress (optional, used by FindKernelCr3):
 //   scannedPa – current physical address being scanned
 //   returns false to request cancellation of the scan
 using FnMap     = std::function<bool(uint64_t pa, uintptr_t* outVa, size_t size)>;
@@ -91,11 +91,12 @@ enum class MmioStatus
 	Ok,                // success
 	BadCallbacks,      // null FnMap / FnUnMap supplied
 	NoKernelBase,      // EnumDeviceDrivers failed to report a kernel image
-	NoSystemCr3,       // physical scan did not locate the System CR3
+	NoKernelCr3,       // physical scan did not locate a kernel-mapping CR3
+	NoSystemCr3 [[deprecated("The scan does not identify the System process CR3; use NoKernelCr3")]] = NoKernelCr3,
 	MappingFailed,     // FnMap declined / failed to produce a usable mapping
 	TranslationFailed, // VaToPa could not translate (non-canonical / not-present / PTE read error)
 	NoSeDebugPrivilege,// SeDebugPrivilege could not be enabled (required on Win11 24H2+)
-	Cancelled,         // FindSystemCr3 scan was aborted via the progress callback
+	Cancelled,         // FindKernelCr3 scan was aborted via the progress callback
 	InternalError,     // unexpected low-level failure (SEH-captured access violation)
 	InvalidArgument,   // null buffer, zero/overflowing range, or invalid mapping result
 	NotInitialized,    // operation requires successful Initialize()
@@ -136,7 +137,7 @@ public:
 		: hDevice_(other.hDevice_)
 		, ownsDeviceHandle_(other.ownsDeviceHandle_)
 		, kernelbase_(other.kernelbase_)
-		, system_cr3pa_(other.system_cr3pa_)
+		, kernel_cr3pa_(other.kernel_cr3pa_)
 		, paging_mode_(other.paging_mode_)
 		, fn_pa_map_(std::move(other.fn_pa_map_))
 		, fn_pa_unmap_(std::move(other.fn_pa_unmap_))
@@ -147,7 +148,7 @@ public:
 		other.hDevice_      = INVALID_HANDLE_VALUE;
 		other.ownsDeviceHandle_ = false;
 		other.kernelbase_   = 0;
-		other.system_cr3pa_ = 0;
+		other.kernel_cr3pa_ = 0;
 		other.paging_mode_  = mmio_model::PagingMode::Unknown;
 		other.fn_pa_map_ = nullptr;
 		other.fn_pa_unmap_ = nullptr;
@@ -163,7 +164,7 @@ public:
 			hDevice_      = other.hDevice_;       other.hDevice_      = INVALID_HANDLE_VALUE;
 			ownsDeviceHandle_ = other.ownsDeviceHandle_; other.ownsDeviceHandle_ = false;
 			kernelbase_   = other.kernelbase_;     other.kernelbase_   = 0;
-			system_cr3pa_ = other.system_cr3pa_;   other.system_cr3pa_ = 0;
+			kernel_cr3pa_ = other.kernel_cr3pa_;   other.kernel_cr3pa_ = 0;
 			paging_mode_  = other.paging_mode_;    other.paging_mode_ = mmio_model::PagingMode::Unknown;
 			fn_pa_map_   = std::move(other.fn_pa_map_);
 			fn_pa_unmap_ = std::move(other.fn_pa_unmap_);
@@ -186,7 +187,7 @@ public:
 	// Initialization must succeed before ReadKernelMemory /
 	// WriteKernelMemory / VaToPa (without explicit CR3).
 	// Each call starts with empty caches and returns false if kernel base or
-	// system CR3 could not be located.
+	// a kernel-mapping CR3 could not be located.
 	// Precise failure reason available via last_status() / last_error().
 	[[nodiscard]] bool Initialize();
 
@@ -210,23 +211,34 @@ public:
 	                                                 uint64_t cr3pa, mmio_model::PagingMode mode);
 
 	// Translate a kernel virtual address to a physical address.
-	// When cr3pa == 0 the cached system_cr3pa_ (set by Initialize / FindSystemCr3) is used.
+	// When cr3pa == 0 the cached kernel_cr3pa_ (set by Initialize / FindKernelCr3) is used.
 	// Returns 0 on any failure (non-canonical VA, not-present entry, unmapped PTE, read error).
 	uint64_t VaToPa(uint64_t va, uint64_t cr3pa = 0);
 	uint64_t VaToPaWithMode(uint64_t va, uint64_t cr3pa, mmio_model::PagingMode mode);
 	mmio_model::PagingMode paging_mode() const { return paging_mode_; }
 
 	// Locate the NT kernel base address (via EnumDeviceDrivers).
+	// Attempts to enable SeDebugPrivilege for this lookup; the privilege must
+	// be present in the process token on Windows 11 24H2 and later.
 	uint64_t GetKernelBase();
 
-	// Scan physical memory for the System process CR3 value.
+	// Scan physical memory for a page-table root that maps the kernel image.
+	// This does not identify the System process's CR3: other kernel address
+	// spaces can satisfy the same kernel-image translation check.
 	// progress is an optional cancellation callback (return false to abort);
 	// it is invoked once per scanned 2 MB window with the current physical address.
-	uint64_t FindSystemCr3(FnProgress progress = nullptr);
+	uint64_t FindKernelCr3(FnProgress progress = nullptr);
+	[[deprecated("This only finds a kernel-mapping CR3, not the System process CR3; use FindKernelCr3")]]
+	uint64_t FindSystemCr3(FnProgress progress = nullptr)
+	{
+		return FindKernelCr3(std::move(progress));
+	}
 
 	// Cached values filled by Initialize().
 	uint64_t kernel_base()  const { return kernelbase_; }
-	uint64_t system_cr3pa() const { return system_cr3pa_; }
+	uint64_t kernel_cr3pa() const { return kernel_cr3pa_; }
+	[[deprecated("This is a kernel-mapping CR3, not necessarily the System process CR3; use kernel_cr3pa")]]
+	uint64_t system_cr3pa() const { return kernel_cr3pa_; }
 
 	// Diagnostic accessors used after Initialize() / Read* / Write* failures.
 	MmioStatus   last_status() const { return last_status_; }
@@ -312,7 +324,7 @@ private:
 	HANDLE   hDevice_      = INVALID_HANDLE_VALUE;
 	bool     ownsDeviceHandle_ = true;
 	uint64_t kernelbase_   = 0;
-	uint64_t system_cr3pa_ = 0;
+	uint64_t kernel_cr3pa_ = 0;
 	mmio_model::PagingMode paging_mode_ = mmio_model::PagingMode::Unknown;
 	FnMap    fn_pa_map_;
 	FnUnMap  fn_pa_unmap_;
@@ -463,7 +475,7 @@ inline bool Mmio::Initialize()
 	// Initialization is transactional: callers never observe stale cached
 	// addresses from a previous attempt after a later attempt fails.
 	kernelbase_   = 0;
-	system_cr3pa_ = 0;
+	kernel_cr3pa_ = 0;
 	paging_mode_  = mmio_model::PagingMode::Unknown;
 	last_status_ = MmioStatus::Ok;
 	last_error_  = 0;
@@ -472,11 +484,6 @@ inline bool Mmio::Initialize()
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-
-	// On Windows 11 24H2+ EnumDeviceDrivers requires SeDebugPrivilege.
-	// Best-effort enable — if it fails on older Windows, GetKernelBase()
-	// can still succeed without it.
-	EnableSeDebugPrivilege();
 
 	kernelbase_ = GetKernelBase();
 	if (!kernelbase_) {
@@ -489,9 +496,9 @@ inline bool Mmio::Initialize()
 		return false;
 	}
 
-	system_cr3pa_ = FindSystemCr3();
-	if (!system_cr3pa_) {
-		if (last_status_ == MmioStatus::Ok) last_status_ = MmioStatus::NoSystemCr3;
+	kernel_cr3pa_ = FindKernelCr3();
+	if (!kernel_cr3pa_) {
+		if (last_status_ == MmioStatus::Ok) last_status_ = MmioStatus::NoKernelCr3;
 		return false;
 	}
 
@@ -631,7 +638,7 @@ inline bool Mmio::ReadKernelMemoryImpl(uint64_t va, void* buf, size_t size, size
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (!cr3pa && !system_cr3pa_) {
+	if (!cr3pa && !kernel_cr3pa_) {
 		last_status_ = MmioStatus::NotInitialized;
 		return false;
 	}
@@ -692,7 +699,7 @@ inline bool Mmio::WriteKernelMemoryImpl(uint64_t va, const void* buf, size_t siz
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (!cr3pa && !system_cr3pa_) {
+	if (!cr3pa && !kernel_cr3pa_) {
 		last_status_ = MmioStatus::NotInitialized;
 		return false;
 	}
@@ -730,7 +737,7 @@ inline uint64_t Mmio::VaToPaWithMode(uint64_t va, uint64_t cr3pa,
 {
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
-	if (!cr3pa) cr3pa = system_cr3pa_;
+	if (!cr3pa) cr3pa = kernel_cr3pa_;
 	if (!cr3pa) {
 		last_status_ = MmioStatus::NotInitialized;
 		return 0;
@@ -786,6 +793,7 @@ inline bool Mmio::EnableSeDebugPrivilege()
 	}
 	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
+	SetLastError(ERROR_SUCCESS);
 	BOOL result = AdjustTokenPrivileges(hToken, FALSE, &tp,
 	                                    sizeof(tp), nullptr, nullptr);
 	DWORD err = GetLastError();
@@ -797,6 +805,11 @@ inline uint64_t Mmio::GetKernelBase()
 {
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
+	// EnumDeviceDrivers returns NULL image bases on Windows 11 24H2+ unless
+	// SeDebugPrivilege is enabled. Keep this public method self-contained;
+	// failure to enable remains non-fatal on older systems where it is not needed.
+	EnableSeDebugPrivilege();
+
 	auto failWithError = [this](DWORD error) -> uint64_t {
 		last_error_ = error;
 		if (error == ERROR_PRIVILEGE_NOT_HELD)
@@ -891,7 +904,7 @@ inline uint64_t Mmio::GetKernelBase()
 	return reinterpret_cast<uint64_t>(kernelCandidates[selection.index]);
 }
 
-inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
+inline uint64_t Mmio::FindKernelCr3(FnProgress progress)
 {
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
@@ -1041,7 +1054,7 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 			}
 
 			if (found) {
-				system_cr3pa_ = resultCr3;
+				kernel_cr3pa_ = resultCr3;
 				paging_mode_ = resultMode;
 				last_status_ = MmioStatus::Ok;
 				return resultCr3;
@@ -1054,6 +1067,6 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 	if (sawAmbiguousMode) last_status_ = MmioStatus::UnsupportedPagingMode;
 	else if (sawNullMapping || sawInvalidMapAddress) last_status_ = MmioStatus::InvalidArgument;
 	else if (!anyMapping) last_status_ = MmioStatus::MappingFailed;
-	else last_status_ = MmioStatus::NoSystemCr3;
+	else last_status_ = MmioStatus::NoKernelCr3;
 	return 0;
 }

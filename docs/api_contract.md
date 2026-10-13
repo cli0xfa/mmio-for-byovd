@@ -10,13 +10,15 @@ All address ranges use `[address, address + size)`. The exclusive end must be re
 
 ## Memory operations
 
-All read and write methods reject zero length, null buffers, and overflowing ranges with `InvalidArgument` before invoking `FnMap`. Physical reads and writes accept at most one two-page window; kernel operations split work at 4 KB boundaries. The bool methods and three-argument detailed methods use the cached System CR3 and require successful `Initialize()`. The five-argument detailed overloads can run without cached initialization when given a nonzero CR3 and an explicit paging mode.
+All read and write methods reject zero length, null buffers, and overflowing ranges with `InvalidArgument` before invoking `FnMap`. Physical reads and writes accept at most one two-page window; kernel operations split work at 4 KB boundaries. The bool methods and three-argument detailed methods use the cached kernel-mapping CR3 and require successful `Initialize()`. The five-argument detailed overloads can run without cached initialization when given a nonzero CR3 and an explicit paging mode.
 
 The `bool` result reports whether the whole request completed. If a multi-page operation fails part way through, prior segments remain completed and are not rolled back. `ReadKernelMemoryDetailed` and `WriteKernelMemoryDetailed` report bytes in fully completed page segments, meaning bytes the library confirmed completed. A fault part way through the current segment is not counted, even though a write fault may occur after some bytes in that segment were already changed. Writes are not rolled back.
 
 ## Paging mode
 
-`PagingMode::Unknown` is not guessed as four-level. `VaToPa()` uses a mode discovered while validating a System CR3, or a 5-level-exclusive kernel image address. Shared high-half addresses are ambiguous. `VaToPaWithMode()` lets a caller with independent evidence supply the mode explicitly. CR3 discovery validates both models against the kernel PE signature and accepts a candidate only when exactly one mode matches.
+`PagingMode::Unknown` is not guessed as four-level. `VaToPa()` uses a mode discovered while validating a kernel-mapping CR3, or a 5-level-exclusive kernel image address. Shared high-half addresses are ambiguous. `VaToPaWithMode()` lets a caller with independent evidence supply the mode explicitly. CR3 discovery validates both models against the kernel PE signature and accepts a candidate only when exactly one mode matches. This proves that the candidate maps the kernel image; it does not identify the System process's CR3. `FindSystemCr3()` and `system_cr3pa()` are deprecated source-compatibility aliases for `FindKernelCr3()` and `kernel_cr3pa()`.
+
+`GetKernelBase()` attempts to enable `SeDebugPrivilege` before calling `EnumDeviceDrivers`. Windows 11 24H2 and later require this privilege to be present in the process token; when it is unavailable, the method returns zero with `NoSeDebugPrivilege`.
 
 ## Object state and concurrency
 

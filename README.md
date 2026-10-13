@@ -1,6 +1,6 @@
 # mmio-for-byovd
 
-一个 **header-only** 的物理内存映射辅助库（`mmio.hpp` 与两个平台无关的模型头文件）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、System CR3 定位」的通用封装。
+一个 **header-only** 的物理内存映射辅助库（`mmio.hpp` 与两个平台无关的模型头文件）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、可用于内核映射的 CR3 定位」的通用封装。
 
 **一句话**：你提供 `FnMap`/`FnUnMap`（映射/取消映射物理页的回调），这个库帮你完成剩下的内核内存访问工作。
 
@@ -11,7 +11,7 @@
 BYOVD（Bring Your Own Vulnerable Driver）场景下，你加载了一个有物理内存映射能力的驱动，但驱动通常只暴露最原始的 IOCTL——把某个物理页映射到用户态虚拟地址。在此之上你还需要：
 
 - 定位 **ntoskrnl.exe** 基址
-- 扫描物理内存找到 **System 进程的 CR3**（页表基址）
+- 扫描物理内存找到一个**可翻译内核映像的 CR3**（页表基址）
 - 用该 CR3 把**内核虚拟地址翻译为物理地址**（走页表遍历，支持 4/5 级分页、2 MB/1 GB 大页）
 - 在翻译好的地址上**安全地读写内核内存**（自动处理跨页分段、SEH 容错）
 
@@ -61,7 +61,7 @@ int main()
     }
 
     printf("ntoskrnl  = 0x%llx\n", mmio.kernel_base());
-    printf("System CR3 = 0x%llx\n", mmio.system_cr3pa());
+    printf("Kernel-mapping CR3 = 0x%llx\n", mmio.kernel_cr3pa());
 
     uint16_t mz = 0;
     mmio.ReadKernelMemory(mmio.kernel_base(), &mz, 2);
@@ -82,7 +82,7 @@ int main()
 | `Ok` | 成功 |
 | `BadCallbacks` | `FnMap`/`FnUnMap` 为空 |
 | `NoKernelBase` | 未能取得内核基址 |
-| `NoSystemCr3` | 物理扫描未找到 System CR3 |
+| `NoKernelCr3` | 物理扫描未找到可翻译内核映像的 CR3 |
 | `MappingFailed` | 回调拒绝映射 |
 | `TranslationFailed` | VA→PA 翻译失败 |
 | `NoSeDebugPrivilege` | 无法启用 SeDebugPrivilege（Win11 24H2+） |
@@ -99,8 +99,8 @@ int main()
 
 | 方法 | 说明 |
 |---|---|
-| `Initialize()` | 清空旧缓存并重新定位内核基址、扫描 System CR3 |
-| `VaToPa(va, cr3pa=0)` | 内核 VA → 物理地址翻译（默认用缓存的 System CR3） |
+| `Initialize()` | 清空旧缓存并重新定位内核基址、扫描内核映射 CR3 |
+| `VaToPa(va, cr3pa=0)` | 内核 VA → 物理地址翻译（默认用缓存的内核映射 CR3） |
 | `VaToPaWithMode(va, cr3pa, mode)` | 显式指定分页模式翻译，用于模式已知的调用方和模拟测试 |
 | `ReadKernelMemory(va, buf, size)` | 安全读内核内存（自动跨页分段） |
 | `WriteKernelMemory(va, buf, size)` | 安全写内核内存（自动跨页分段） |
@@ -108,11 +108,13 @@ int main()
 | `ReadPhysicalMemory(pa, buf, size)` | 直接读物理内存（单次最多跨一页边界） |
 | `WritePhysicalMemory(pa, buf, size)` | 直接写物理内存 |
 | `GetKernelBase()` | 通过 `EnumDeviceDrivers` 获取 NT 内核基址 |
-| `FindSystemCr3(progress)` | 扫描物理内存定位 System CR3 |
+| `FindKernelCr3(progress)` | 扫描物理内存定位可翻译内核映像的 CR3 |
 | `kernel_base()` | 缓存的内核基址（`Initialize()` 后可用） |
-| `system_cr3pa()` | 缓存的 System CR3（`Initialize()` 后可用） |
+| `kernel_cr3pa()` | 缓存的内核映射 CR3（`Initialize()` 后可用） |
 | `last_status()` | 最近一次操作的状态 |
 | `last_error()` | 最近一次 `GetLastError()` 值 |
+
+`GetKernelBase()` 会尝试启用当前进程令牌中的 `SeDebugPrivilege`。Windows 11 24H2 及更新版本要求该权限可用；若令牌没有此权限，方法会返回 0 并设置 `NoSeDebugPrivilege`。
 
 ### 回调契约
 
@@ -130,7 +132,9 @@ int main()
 - 多页内核读写按页逐段执行。若中途失败，先前完成的段不会回滚；原有 `bool` API 不报告进度，`Detailed` 版本会返回已完整完成的页段字节数。
 - `Mmio` 对象不提供并发安全保证；调用方必须串行化共享实例上的操作及状态查询。
 
-`FindSystemCr3()` 的精确扫描依赖 `FnGetPhysicalRanges`。旧式三参数构造保留容量估算回退，以维持现有源代码兼容；含内存空洞或重映射的机器应提供真实范围，避免漏扫。
+`FindKernelCr3()` 的精确扫描依赖 `FnGetPhysicalRanges`。旧式三参数构造保留容量估算回退，以维持现有源代码兼容；含内存空洞或重映射的机器应提供真实范围，避免漏扫。
+
+CR3 扫描只确认候选页表能映射内核映像，不识别它是否属于 System 进程。旧 API 名 `FindSystemCr3()`、`system_cr3pa()` 和状态值 `NoSystemCr3` 保留为 deprecated 兼容别名；新代码请使用 `FindKernelCr3()`、`kernel_cr3pa()` 和 `NoKernelCr3`。
 
 4 级和 5 级共享高地址区时，分页模式不会从地址本身猜测。CR3 扫描会分别验证两种页表模型，并且只在内核映像签名唯一匹配时缓存模式；两种模式均匹配则返回 `UnsupportedPagingMode`。直接调用 `VaToPa()` 前若尚未识别模式，应使用 `VaToPaWithMode()` 并传入明确模式。普通内核读写和三参数 `Detailed` 调用需要先成功初始化；五参数 `Detailed` 重载允许调用方直接提供非零 CR3 与已确认的分页模式。
 

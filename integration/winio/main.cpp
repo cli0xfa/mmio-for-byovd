@@ -9,7 +9,7 @@
 //   0x80102044  UnmapPhysicalMemory METHOD_BUFFERED, in     0x28-byte struct
 //
 // Those become the FnMap / FnUnMap callbacks consumed by the mmio library,
-// which then runs the real test scenarios: locate ntoskrnl, scan System CR3,
+// which then runs the real test scenarios: locate ntoskrnl, scan a kernel CR3,
 // translate kernel VAs, and read kernel memory.
 
 #include <windows.h>
@@ -62,7 +62,7 @@ static const char* StatusName(MmioStatus s)
 	case MmioStatus::Ok:                  return "Ok";
 	case MmioStatus::BadCallbacks:       return "BadCallbacks";
 	case MmioStatus::NoKernelBase:        return "NoKernelBase";
-	case MmioStatus::NoSystemCr3:         return "NoSystemCr3";
+	case MmioStatus::NoKernelCr3:         return "NoKernelCr3";
 	case MmioStatus::MappingFailed:       return "MappingFailed";
 	case MmioStatus::TranslationFailed:   return "TranslationFailed";
 	case MmioStatus::NoSeDebugPrivilege:  return "NoSeDebugPrivilege";
@@ -79,10 +79,8 @@ static const char* StatusName(MmioStatus s)
 }
 
 // ---------------------------------------------------------------------------
-// Privilege helper: mmio enables SeDebugPrivilege internally during
-// Initialize(); we enable it for the whole process up front so a standalone
-// GetKernelBase() probe (which does not call the internal enable) works too,
-// and so SCM service-control calls succeed under the elevated token.
+// Privilege helper: enable SeDebugPrivilege for SCM service-control calls.
+// GetKernelBase() now enables it itself before EnumDeviceDrivers.
 // ---------------------------------------------------------------------------
 static void EnableDebugPrivilege()
 {
@@ -265,7 +263,7 @@ static void TestBadCallbacks()
 	// NON-ZERO cr3pa so VaToPa skips its "no CR3 cached" early-out (the lib
 	// checks CR3 availability *before* callback validity) and actually reaches
 	// the CallbacksValid() guard — otherwise a cr3pa=0 call with no cached
-	// system_cr3pa_ returns TranslationFailed, not BadCallbacks.
+	// kernel_cr3pa_ returns TranslationFailed, not BadCallbacks.
 	if (m.VaToPa(0xFFFF800000000000ull, /*cr3pa=*/1) == 0
 		&& m.last_status() == MmioStatus::BadCallbacks)
 		Pass("VaToPa rejects no callbacks");
@@ -329,17 +327,17 @@ static void TestSizeBoundNoDriver()
 		Fail("successful zero-address mapping is rejected and released");
 }
 
-// Initialization: GetKernelBase + FindSystemCr3 both succeed → cached values.
+// Initialization: GetKernelBase + FindKernelCr3 both succeed → cached values.
 static void TestInitialize(Mmio& m)
 {
 	puts("[*] test: Initialize");
 	if (m.Initialize()
 		&& m.kernel_base()  != 0
-		&& m.system_cr3pa() != 0
+		&& m.kernel_cr3pa() != 0
 		&& m.last_status()  == MmioStatus::Ok)
-		Pass("Initialize fills kernel_base + system_cr3pa");
+		Pass("Initialize fills kernel_base + kernel_cr3pa");
 	else
-		Fail("Initialize fills kernel_base + system_cr3pa");
+		Fail("Initialize fills kernel_base + kernel_cr3pa");
 }
 
 static void TestKernelBaseIndependent(Mmio& m)
@@ -411,7 +409,7 @@ static void TestVaToPa(Mmio& m)
 {
 	puts("[*] test: VaToPa core paths");
 	const uint64_t kbase = m.kernel_base();
-	const uint64_t cr3   = m.system_cr3pa();
+	const uint64_t cr3   = m.kernel_cr3pa();
 
 	if (m.VaToPa(kbase)      != 0) Pass("VaToPa(kernel_base) -> nonzero PA");
 	else Fail("VaToPa(kernel_base) -> nonzero PA");
@@ -463,24 +461,26 @@ static void TestWriteBackUnchanged(Mmio& m)
 		Fail("WriteKernelMemory write-back preserves bytes");
 }
 
-// FindSystemCr3 with a progress callback that cancels immediately → must
+// FindKernelCr3 with a progress callback that cancels immediately → must
 // return 0 and set last_status() == Cancelled, but NOT wipe the cached CR3.
-static void TestFindSystemCr3Cancel(Mmio& m)
+static void TestFindKernelCr3Cancel(Mmio& m)
 {
-	puts("[*] test: FindSystemCr3 cancel via progress");
-	const uint64_t cached = m.system_cr3pa();
-	const uint64_t got    = m.FindSystemCr3([](uint64_t) { return false; });
+	puts("[*] test: FindKernelCr3 cancel via progress");
+	const uint64_t cached = m.kernel_cr3pa();
+	const uint64_t got    = m.FindKernelCr3([](uint64_t) { return false; });
 	if (got == 0
 		&& m.last_status()   == MmioStatus::Cancelled
-		&& m.system_cr3pa()  == cached)               // cache preserved through cancel
-		Pass("FindSystemCr3(progress=false) -> 0 + Cancelled");
+		&& m.kernel_cr3pa()  == cached)               // cache preserved through cancel
+		Pass("FindKernelCr3(progress=false) -> 0 + Cancelled");
 	else
-		Fail("FindSystemCr3(progress=false) -> 0 + Cancelled");
+		Fail("FindKernelCr3(progress=false) -> 0 + Cancelled");
 }
 
 // ---------------------------------------------------------------------------
 int main()
 {
+	SetConsoleOutputCP(CP_UTF8);
+
 	puts("==================================================================");
 	puts(" mmio-for-byovd — WinIo64.sys test harness");
 	puts("==================================================================");
@@ -559,9 +559,9 @@ int main()
 	Mmio mmio(hDev, fnMap, fnUnmap, nullptr, /*ownsDeviceHandle=*/false);
 
 	if (mmio.Initialize()) {
-		printf("[+] Mmio::Initialize ok: kernel_base=0x%llx  System_CR3=0x%llx\n",
+		printf("[+] Mmio::Initialize ok: kernel_base=0x%llx  kernel_CR3=0x%llx\n",
 			(unsigned long long)mmio.kernel_base(),
-			(unsigned long long)mmio.system_cr3pa());
+			(unsigned long long)mmio.kernel_cr3pa());
 
 		TestKernelBaseIndependent(mmio);
 		TestReadMz(mmio);
@@ -570,7 +570,7 @@ int main()
 		TestVaToPa(mmio);
 		TestReadPhysicalMemory(mmio);
 		TestWriteBackUnchanged(mmio);
-		TestFindSystemCr3Cancel(mmio);
+		TestFindKernelCr3Cancel(mmio);
 
 		// Re-run the Initialize passthrough assertions (re-caches, harmless)
 		// to confirm the full Initialize contract independently of the
