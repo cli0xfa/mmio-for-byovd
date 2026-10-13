@@ -109,19 +109,21 @@ void TestInvalidArgumentsAndMappingFailure()
 void TestNullMappingIsReleased()
 {
     int unmaps = 0;
+    uintptr_t unmappedAddress = UINTPTR_MAX;
     Mmio mmio(nullptr,
         [](uint64_t, uintptr_t* out, size_t) { *out = 0; return true; },
-        [&unmaps](uintptr_t) { ++unmaps; });
+        [&unmaps, &unmappedAddress](uintptr_t address) { ++unmaps; unmappedAddress = address; });
     uint8_t value = 0;
     Check(!mmio.ReadPhysicalMemory(0, &value, 1) &&
-          mmio.last_status() == MmioStatus::InvalidArgument && unmaps == 1,
-          "successful null mapping is rejected and released exactly once");
+          mmio.last_status() == MmioStatus::InvalidArgument && unmaps == 1 && unmappedAddress == 0,
+          "successful null mapping is rejected and UnMap(0) is attempted exactly once");
 }
 
 void TestCallbackFailureLifecycle()
 {
     uint8_t value = 0;
     int unmaps = 0;
+    uintptr_t unmappedAddress = 0;
     Mmio throwingMap(nullptr,
         [](uint64_t, uintptr_t*, size_t) -> bool { throw std::runtime_error("map"); },
         [&unmaps](uintptr_t) { ++unmaps; });
@@ -131,9 +133,10 @@ void TestCallbackFailureLifecycle()
 
     Mmio invalidMapping(nullptr,
         [](uint64_t, uintptr_t* out, size_t) { *out = UINTPTR_MAX - 0x10u; return true; },
-        [&unmaps](uintptr_t) { ++unmaps; });
+        [&unmaps, &unmappedAddress](uintptr_t address) { ++unmaps; unmappedAddress = address; });
     Check(!invalidMapping.ReadPhysicalMemory(0, &value, 1) &&
-          invalidMapping.last_status() == MmioStatus::InvalidArgument && unmaps == 1,
+          invalidMapping.last_status() == MmioStatus::InvalidArgument && unmaps == 1 &&
+          unmappedAddress == UINTPTR_MAX - 0x10u,
           "overflowing successful map is rejected and released exactly once");
 
     unmaps = 0;
@@ -159,11 +162,29 @@ void TestCallbackFailureLifecycle()
           "unmap callback exception is contained after exactly one cleanup attempt");
 }
 
-void TestMoveAssignmentTransfersCallbacks()
+void TestMoveConstructionAndAssignmentTransfersCallbacks()
 {
     uint8_t physicalPage[0x1000]{};
     physicalPage[0] = 0x5A;
     int unmaps = 0;
+    Mmio constructionSource(nullptr,
+        [&physicalPage](uint64_t, uintptr_t* out, size_t size) {
+            if (size != sizeof(physicalPage)) return false;
+            *out = reinterpret_cast<uintptr_t>(physicalPage);
+            return true;
+        },
+        [&unmaps](uintptr_t) { ++unmaps; });
+    Mmio constructionTarget(std::move(constructionSource));
+    uint8_t constructedValue = 0;
+    Check(constructionTarget.ReadPhysicalMemory(0, &constructedValue, 1) &&
+          constructedValue == 0x5A && unmaps == 1,
+          "move construction transfers mapping callbacks and cleanup obligation");
+    uint8_t movedFromValue = 0;
+    Check(!constructionSource.ReadPhysicalMemory(0, &movedFromValue, 1) &&
+          constructionSource.last_status() == MmioStatus::BadCallbacks,
+          "move-constructed source clears callbacks");
+
+    unmaps = 0;
     Mmio source(nullptr,
         [&physicalPage](uint64_t, uintptr_t* out, size_t size) {
             if (size != sizeof(physicalPage)) return false;
@@ -222,7 +243,7 @@ int main()
     TestInvalidArgumentsAndMappingFailure();
     TestNullMappingIsReleased();
     TestCallbackFailureLifecycle();
-    TestMoveAssignmentTransfersCallbacks();
+    TestMoveConstructionAndAssignmentTransfersCallbacks();
     TestDetailedPartialOperations();
     return failures == 0 ? 0 : 1;
 }

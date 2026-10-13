@@ -11,7 +11,8 @@
 | `MappingFailed` | The mapping backend rejected a physical mapping request |
 | `TranslationFailed` | A page-table entry was absent or reserved, or its address could not be translated |
 | `PhysicalRangesUnavailable` | The exact range provider failed or returned no ranges |
-| `NoKernelBase` / `NoSystemCr3` | OS kernel enumeration or CR3 validation found no usable result |
+| `NoKernelBase` | OS kernel enumeration found no usable image. `last_error()` distinguishes no recognized kernel image (`ERROR_NOT_FOUND`), ambiguous matches or malformed lengths (`ERROR_INVALID_DATA`), an unstable list (`ERROR_INSUFFICIENT_BUFFER`), and allocation failure (`ERROR_NOT_ENOUGH_MEMORY`). |
+| `NoSystemCr3` | Physical scanning did not validate a System CR3 candidate |
 | `NoSeDebugPrivilege` | Kernel driver enumeration was denied because SeDebugPrivilege was unavailable |
 | `AccessDenied` | A Windows API denied access for another privilege or policy reason |
 | `Cancelled` | The scan progress callback requested cancellation |

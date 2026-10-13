@@ -1,6 +1,6 @@
 # mmio-for-byovd
 
-一个 **header-only** 的物理内存映射辅助库（`mmio.hpp` 与平台无关的 `mmio_paging_model.hpp`）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、System CR3 定位」的通用封装。
+一个 **header-only** 的物理内存映射辅助库（`mmio.hpp` 与两个平台无关的模型头文件）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、System CR3 定位」的通用封装。
 
 **一句话**：你提供 `FnMap`/`FnUnMap`（映射/取消映射物理页的回调），这个库帮你完成剩下的内核内存访问工作。
 
@@ -116,8 +116,10 @@ int main()
 
 ### 回调契约
 
-- **FnMap**(pa, &outVa, size)：把物理页 `[pa, pa+size)` 映射到用户态虚拟地址，成功置 `*outVa` 返回 `true`。size 常见取值 `0x1000`、`0x2000`、`0x200000`。回调内**不应抛异常**。
-- **FnUnMap**(va)：释放 `FnMap` 返回的映射。
+- **FnMap**(pa, &outVa, size)：把物理页 `[pa, pa+size)` 映射到用户态虚拟地址；返回 `true` 表示映射有效，并要求 `*outVa` 非零且整个区间不溢出。size 常见取值 `0x1000`、`0x2000`、`0x200000`。回调内**不应抛异常**。
+- **FnUnMap**(va)：释放 `FnMap` 返回的映射。`FnMap` 返回 `true` 就产生一次清理义务，即使地址无效也会恰好尝试调用一次（零地址会调用 `FnUnMap(0)`）；返回 `false` 不得遗留映射。
+
+`FnUnMap` 返回类型为 `void`，因此无法把清理失败写入 `MmioStatus`；异常会被吞掉，清理按尽力而为处理。
 - **FnGetPhysicalRanges**(outRanges)：可选第四个构造参数，返回实际物理地址区间；每项必须页对齐、非空且不溢出。
 - 构造函数默认拥有并关闭传入的设备句柄。传入借用句柄时，将第四参数设为 `nullptr`、第五参数设为 `false`。
 - `Mmio` 在本版本中是 move-only；复制构造和复制赋值已禁用，以免两个对象重复关闭同一句柄。需要转移对象时使用 `std::move`。
@@ -136,7 +138,7 @@ int main()
 
 ## 集成到你的工程
 
-1. 把 `mmio-for-byovd/` 加入 include 路径，并保留两个头文件的相对位置
+1. 把 `mmio-for-byovd/` 加入 include 路径，并保留三个头文件的相对位置
 2. 链接 `psapi.lib`（已 `#pragma comment(lib, "psapi.lib")`，可用 `#define MMIO_NO_LIB_PRAGMA` 关闭）
 3. 工程需 C++20+ 且 `/EHsc`（已为 SEH 兼容性准备，详见代码注释）
 

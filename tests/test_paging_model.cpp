@@ -156,6 +156,7 @@ void TestFailuresAndBoundaries()
 
     Check(!mmio_model::IsValidRange(UINT64_MAX, 1), "range ending past UINT64_MAX rejected");
     Check(!mmio_model::IsValidRange(0, 0), "zero-length range rejected");
+    Check(mmio_model::IsValidRange(0, 1), "range beginning at zero is valid");
     Check(mmio_model::IsValidRange(UINT64_MAX - 1, 1), "last representable non-overflowing range accepted");
     Check(mmio_model::IsPhysicalRangeSupported(0, 1ull << 48, 48) &&
           !mmio_model::IsPhysicalRangeSupported(0, 1ull << 48, 47),

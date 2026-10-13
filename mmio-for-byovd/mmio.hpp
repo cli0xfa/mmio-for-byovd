@@ -54,6 +54,7 @@
 #include <vector>
 #include <intrin.h>
 #include "mmio_paging_model.hpp"
+#include "mmio_driver_enumeration_model.hpp"
 
 // NOTE: This header-only library relies on the consumer project for linking
 // psapi.lib. The pragma below is kept as a convenience so that simply
@@ -796,89 +797,98 @@ inline uint64_t Mmio::GetKernelBase()
 {
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
-
-	// Size query: passing cb = 0 always returns FALSE with
-	// ERROR_INSUFFICIENT_BUFFER and writes the required byte count to
-	// *lpcbNeeded — this is the documented, expected "query" path, NOT an
-	// error to retry. The previous implementation treated this FALSE as a
-	// retry and re-zeroed cbNeeded each iteration, so the allocation path was
-	// unreachable and GetKernelBase() always returned 0 (Initialize() then
-	// always failed with NoKernelBase).
-	DWORD cbNeeded = 0;
-	if (!EnumDeviceDrivers(nullptr, 0, &cbNeeded)) {
-		last_error_ = GetLastError();
-		if (last_error_ != ERROR_INSUFFICIENT_BUFFER)
-			return 0;   // genuine failure — no kernel image retrievable
-		// else: cbNeeded holds the required size (the expected, normal path).
-	}
-	if (cbNeeded == 0)
-	{
-		last_error_ = ERROR_NOT_FOUND;
+	auto failWithError = [this](DWORD error) -> uint64_t {
+		last_error_ = error;
+		if (error == ERROR_PRIVILEGE_NOT_HELD)
+			last_status_ = MmioStatus::NoSeDebugPrivilege;
+		else if (error == ERROR_ACCESS_DENIED)
+			last_status_ = MmioStatus::AccessDenied;
+		else
+			last_status_ = MmioStatus::NoKernelBase;
 		return 0;
+	};
+
+	auto enumerateDrivers = [](LPVOID* entries, size_t capacityBytes) {
+		if (capacityBytes > MAXDWORD)
+			return mmio_model::EnumerationCall{
+				mmio_model::EnumerationCallStatus::Failure, 0, ERROR_ARITHMETIC_OVERFLOW};
+		DWORD reportedBytes = 0;
+		const BOOL success = EnumDeviceDrivers(entries, static_cast<DWORD>(capacityBytes),
+		                                       &reportedBytes);
+		const DWORD error = success ? ERROR_SUCCESS : GetLastError();
+		const auto status = success
+			? mmio_model::EnumerationCallStatus::Success
+			: error == ERROR_INSUFFICIENT_BUFFER
+				? mmio_model::EnumerationCallStatus::InsufficientBuffer
+				: mmio_model::EnumerationCallStatus::Failure;
+		return mmio_model::EnumerationCall{status, static_cast<size_t>(reportedBytes), error};
+	};
+	const auto enumeration = mmio_model::CollectEnumeration<LPVOID>(enumerateDrivers);
+	if (!enumeration) {
+		DWORD error = enumeration.os_error;
+		switch (enumeration.error) {
+		case mmio_model::EnumerationError::None:
+			break;
+		case mmio_model::EnumerationError::ApiFailure:
+			if (error == ERROR_SUCCESS) error = ERROR_GEN_FAILURE;
+			break;
+		case mmio_model::EnumerationError::Empty:
+			error = ERROR_NOT_FOUND;
+			break;
+		case mmio_model::EnumerationError::InvalidLength:
+			error = ERROR_INVALID_DATA;
+			break;
+		case mmio_model::EnumerationError::Unstable:
+			if (error == ERROR_SUCCESS) error = ERROR_INSUFFICIENT_BUFFER;
+			break;
+		case mmio_model::EnumerationError::AllocationFailure:
+			error = ERROR_NOT_ENOUGH_MEMORY;
+			break;
+		}
+		return failWithError(error);
 	}
+	const auto& drivers = enumeration.entries;
+	const bool anyBase = std::any_of(drivers.begin(), drivers.end(),
+	                                 [](LPVOID base) { return base != nullptr; });
+	// On Windows 11 24H2+, EnumDeviceDrivers can return TRUE while filling
+	// every entry with NULL when SeDebugPrivilege is unavailable.
+	if (!anyBase) return failWithError(ERROR_PRIVILEGE_NOT_HELD);
 
-	// The driver set can change between the size query and the data call; only
-	// THAT failure is worth retrying (re-querying the size each retry).
-	for (int attempt = 0; attempt < 3; ++attempt) {
-		const size_t count = cbNeeded / sizeof(LPVOID);
-		std::vector<LPVOID> drivers(count ? count : 1);
-		DWORD cbNeeded2 = 0;
-		if (!EnumDeviceDrivers(drivers.data(),
-		                      static_cast<DWORD>(drivers.size() * sizeof(LPVOID)),
-		                      &cbNeeded2)) {
-			last_error_ = GetLastError();
-			if (last_error_ == ERROR_INSUFFICIENT_BUFFER && attempt < 2) {
-				cbNeeded = cbNeeded2;   // grow to the new required size and retry
-				continue;
-			}
-			return 0;
-		}
-		if (cbNeeded2 == 0 || drivers.empty()) {
-			last_error_ = ERROR_NOT_FOUND;
-			return 0;
-		}
-
-		// On Windows 11 24H2+, EnumDeviceDrivers returns TRUE but fills
-		// the array with NULLs when SeDebugPrivilege is missing.
-		if (!drivers[0]) {
-			last_error_ = ERROR_PRIVILEGE_NOT_HELD;
-			return 0;
-		}
-
-		// Identify the NT kernel by its base name rather than assuming index 0
-		// is the kernel. EnumDeviceDrivers does not document the array order
-		// (OSR NTDEV community: "usually placed first, but don't rely on it"),
-		// and a /kernel= boot switch or a future enumeration-order change could
-		// otherwise hand back a wrong driver base and silently break the CR3
-		// scan. GetDeviceDriverBaseNameW returns the file name only (no path),
-		// so we compare it case-insensitively against the known kernel image
-		// names (x64 ships ntoskrnl.exe / ntkrnlmp.exe; the PA variants cover the
-		// 32-bit kernels should this code ever be built for them).
-		static const wchar_t* const kKernelNames[] = {
-			L"ntoskrnl.exe", L"ntkrnlmp.exe",
-			L"ntkrnlpa.exe", L"ntkrpamp.exe"
-		};
-		wchar_t nameBuf[64] = {};
+	// Identify the NT kernel by its base name rather than assuming the first
+	// enumerated module is the kernel. Accept exactly one recognized image.
+	static const wchar_t* const kKernelNames[] = {
+		L"ntoskrnl.exe", L"ntkrnlmp.exe",
+		L"ntoskrnlpa.exe", L"ntkrpamp.exe"
+	};
+	wchar_t nameBuf[64] = {};
+	std::vector<LPVOID> kernelCandidates;
+	try {
+		kernelCandidates.reserve(drivers.size());
 		for (LPVOID drvBase : drivers) {
 			if (!drvBase) continue;
-			if (GetDeviceDriverBaseNameW(drvBase, nameBuf, 64) == 0) continue;
+			if (GetDeviceDriverBaseNameW(drvBase, nameBuf,
+			                             static_cast<DWORD>(sizeof(nameBuf) / sizeof(nameBuf[0]))) == 0)
+				continue;
 			for (const wchar_t* k : kKernelNames) {
 				if (lstrcmpiW(nameBuf, k) == 0) {
-					last_error_ = 0;
-					return reinterpret_cast<uint64_t>(drvBase);
+					kernelCandidates.push_back(drvBase);
+					break;
 				}
 			}
 		}
-
-		// Empirical fallback: on every shipping Windows build the first
-		// enumerated driver is the NT kernel image. Kept as a last resort so a
-		// renamed/new kernel image name we did not list still resolves on
-		// current systems; the PE-signature check in FindSystemCr3 still rejects
-		// a non-kernel base during CR3 validation.
-		last_error_ = 0;
-		return reinterpret_cast<uint64_t>(drivers[0]);
+	} catch (...) {
+		return failWithError(ERROR_NOT_ENOUGH_MEMORY);
 	}
-	return 0;
+	const auto selection = mmio_model::SelectUniqueMatch(kernelCandidates,
+		[](size_t) { return true; });
+	if (selection.selection == mmio_model::MatchSelection::None)
+		return failWithError(ERROR_NOT_FOUND);
+	if (selection.selection == mmio_model::MatchSelection::Ambiguous)
+		return failWithError(ERROR_INVALID_DATA);
+
+	last_status_ = MmioStatus::Ok;
+	last_error_ = 0;
+	return reinterpret_cast<uint64_t>(kernelCandidates[selection.index]);
 }
 
 inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
