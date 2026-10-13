@@ -36,12 +36,24 @@
 
 #pragma once
 
+#if !defined(_M_X64)
+#error "mmio-for-byovd requires an x64 compiler target"
+#endif
+#if defined(_MSVC_LANG) && _MSVC_LANG < 202002L
+#error "mmio-for-byovd requires C++20 or later"
+#endif
+
 #include <windows.h>
 #include <psapi.h>
+#include <algorithm>
+#include <cstddef>
 #include <functional>
 #include <cstdint>
+#include <cstring>
+#include <utility>
 #include <vector>
 #include <intrin.h>
+#include "mmio_paging_model.hpp"
 
 // NOTE: This header-only library relies on the consumer project for linking
 // psapi.lib. The pragma below is kept as a convenience so that simply
@@ -66,6 +78,8 @@
 using FnMap     = std::function<bool(uint64_t pa, uintptr_t* outVa, size_t size)>;
 using FnUnMap   = std::function<void(uintptr_t va)>;
 using FnProgress = std::function<bool(uint64_t scannedPa)>;
+using PhysicalRange = mmio_model::PhysicalRange;
+using FnGetPhysicalRanges = std::function<bool(std::vector<PhysicalRange>& outRanges)>;
 
 
 // Lightweight status reporting for Initialize(). The bool return of
@@ -81,18 +95,34 @@ enum class MmioStatus
 	TranslationFailed, // VaToPa could not translate (non-canonical / not-present / PTE read error)
 	NoSeDebugPrivilege,// SeDebugPrivilege could not be enabled (required on Win11 24H2+)
 	Cancelled,         // FindSystemCr3 scan was aborted via the progress callback
-	InternalError,     // unexpected low-level failure (SEH-captured AV / bad arguments)
+	InternalError,     // unexpected low-level failure (SEH-captured access violation)
+	InvalidArgument,   // null buffer, zero/overflowing range, or invalid mapping result
+	NotInitialized,    // operation requires successful Initialize()
+	UnsupportedPagingMode, // active paging mode is unknown or ambiguous
+	PhysicalRangesUnavailable, // exact physical ranges were requested but unavailable
+	InvalidPhysicalRange, // supplied range is unaligned, overflows, or exceeds MAXPHYADDR
+	AccessDenied,       // a Windows API denied access for another privilege or policy reason
+};
+
+struct IoResult
+{
+	MmioStatus status = MmioStatus::Ok;
+	size_t bytes_completed = 0;
+	DWORD os_error = 0;
+	bool succeeded() const noexcept { return status == MmioStatus::Ok; }
 };
 
 
 class Mmio
 {
 public:
-	Mmio(HANDLE h, FnMap fm, FnUnMap fu)
-		: hDevice_(h), fn_pa_map_(std::move(fm)), fn_pa_unmap_(std::move(fu))
+	Mmio(HANDLE h, FnMap fm, FnUnMap fu, FnGetPhysicalRanges ranges = nullptr,
+	     bool ownsDeviceHandle = true)
+		: hDevice_(h), ownsDeviceHandle_(ownsDeviceHandle),
+		  fn_pa_map_(std::move(fm)), fn_pa_unmap_(std::move(fu)),
+		  fn_get_physical_ranges_(std::move(ranges))
 	{
-		// A hardware pseudo-handle (e.g. from a parked mapping driver) may be
-		// passed; we only own/close a real handle. NULL is treated as "none".
+		// Set ownsDeviceHandle=false for borrowed handles or hardware pseudo-handles.
 	}
 
 	// Non-copyable: the instance owns the device handle and cached state.
@@ -103,29 +133,43 @@ public:
 	Mmio& operator=(const Mmio&) = delete;
 	Mmio(Mmio&& other) noexcept
 		: hDevice_(other.hDevice_)
+		, ownsDeviceHandle_(other.ownsDeviceHandle_)
 		, kernelbase_(other.kernelbase_)
 		, system_cr3pa_(other.system_cr3pa_)
+		, paging_mode_(other.paging_mode_)
 		, fn_pa_map_(std::move(other.fn_pa_map_))
 		, fn_pa_unmap_(std::move(other.fn_pa_unmap_))
+		, fn_get_physical_ranges_(std::move(other.fn_get_physical_ranges_))
 		, last_status_(other.last_status_)
 		, last_error_(other.last_error_)
 	{
 		other.hDevice_      = INVALID_HANDLE_VALUE;
+		other.ownsDeviceHandle_ = false;
 		other.kernelbase_   = 0;
 		other.system_cr3pa_ = 0;
+		other.paging_mode_  = mmio_model::PagingMode::Unknown;
+		other.fn_pa_map_ = nullptr;
+		other.fn_pa_unmap_ = nullptr;
+		other.fn_get_physical_ranges_ = nullptr;
 		other.last_status_  = MmioStatus::Ok;
 		other.last_error_   = 0;
 	}
 	Mmio& operator=(Mmio&& other) noexcept
 	{
 		if (this != &other) {
-			if (hDevice_ && hDevice_ != INVALID_HANDLE_VALUE)
+			if (ownsDeviceHandle_ && hDevice_ && hDevice_ != INVALID_HANDLE_VALUE)
 				CloseHandle(hDevice_);
 			hDevice_      = other.hDevice_;       other.hDevice_      = INVALID_HANDLE_VALUE;
+			ownsDeviceHandle_ = other.ownsDeviceHandle_; other.ownsDeviceHandle_ = false;
 			kernelbase_   = other.kernelbase_;     other.kernelbase_   = 0;
 			system_cr3pa_ = other.system_cr3pa_;   other.system_cr3pa_ = 0;
+			paging_mode_  = other.paging_mode_;    other.paging_mode_ = mmio_model::PagingMode::Unknown;
 			fn_pa_map_   = std::move(other.fn_pa_map_);
 			fn_pa_unmap_ = std::move(other.fn_pa_unmap_);
+			fn_get_physical_ranges_ = std::move(other.fn_get_physical_ranges_);
+			other.fn_pa_map_ = nullptr;
+			other.fn_pa_unmap_ = nullptr;
+			other.fn_get_physical_ranges_ = nullptr;
 			last_status_ = other.last_status_;    other.last_status_ = MmioStatus::Ok;
 			last_error_  = other.last_error_;     other.last_error_  = 0;
 		}
@@ -134,13 +178,14 @@ public:
 
 	~Mmio()
 	{
-		if (hDevice_ && hDevice_ != INVALID_HANDLE_VALUE)
+		if (ownsDeviceHandle_ && hDevice_ && hDevice_ != INVALID_HANDLE_VALUE)
 			CloseHandle(hDevice_);
 	}
 
-	// One-shot initialization – must be called before ReadKernelMemory /
+	// Initialization must succeed before ReadKernelMemory /
 	// WriteKernelMemory / VaToPa (without explicit CR3).
-	// Returns false if kernel base or system CR3 could not be located.
+	// Each call starts with empty caches and returns false if kernel base or
+	// system CR3 could not be located.
 	// Precise failure reason available via last_status() / last_error().
 	[[nodiscard]] bool Initialize();
 
@@ -156,11 +201,19 @@ public:
 	// call safely handles arbitrarily large / cross-page buffers.
 	[[nodiscard]] bool ReadKernelMemory(uint64_t va, void* buf, size_t size);
 	[[nodiscard]] bool WriteKernelMemory(uint64_t va, const void* buf, size_t size);
+	[[nodiscard]] IoResult ReadKernelMemoryDetailed(uint64_t va, void* buf, size_t size);
+	[[nodiscard]] IoResult WriteKernelMemoryDetailed(uint64_t va, const void* buf, size_t size);
+	[[nodiscard]] IoResult ReadKernelMemoryDetailed(uint64_t va, void* buf, size_t size,
+	                                                uint64_t cr3pa, mmio_model::PagingMode mode);
+	[[nodiscard]] IoResult WriteKernelMemoryDetailed(uint64_t va, const void* buf, size_t size,
+	                                                 uint64_t cr3pa, mmio_model::PagingMode mode);
 
 	// Translate a kernel virtual address to a physical address.
 	// When cr3pa == 0 the cached system_cr3pa_ (set by Initialize / FindSystemCr3) is used.
 	// Returns 0 on any failure (non-canonical VA, not-present entry, unmapped PTE, read error).
 	uint64_t VaToPa(uint64_t va, uint64_t cr3pa = 0);
+	uint64_t VaToPaWithMode(uint64_t va, uint64_t cr3pa, mmio_model::PagingMode mode);
+	mmio_model::PagingMode paging_mode() const { return paging_mode_; }
 
 	// Locate the NT kernel base address (via EnumDeviceDrivers).
 	uint64_t GetKernelBase();
@@ -192,6 +245,8 @@ private:
 		// from C++20 aggregate-init, so brace-initialization requires a ctor.
 		ScopedMap(const FnUnMap* u, uintptr_t v, bool o) noexcept
 			: unmap(u), va(v), owns(o) {}
+		ScopedMap(const ScopedMap&) = delete;
+		ScopedMap& operator=(const ScopedMap&) = delete;
 		~ScopedMap() noexcept
 		{
 			if (!owns || !unmap || !*unmap) return;
@@ -209,20 +264,30 @@ private:
 
 	// Resolves the physical-address mask (MAXPHYADDR) once and caches it.
 	static uint64_t PaddrMask();
+	static unsigned PaddrBits();
+	bool ReadKernelMemoryImpl(uint64_t va, void* buf, size_t size, size_t* completed,
+	                          uint64_t cr3pa = 0, mmio_model::PagingMode mode = mmio_model::PagingMode::Unknown);
+	bool WriteKernelMemoryImpl(uint64_t va, const void* buf, size_t size, size_t* completed,
+	                           uint64_t cr3pa = 0, mmio_model::PagingMode mode = mmio_model::PagingMode::Unknown);
+	static bool TryMap(const FnMap& fm, uint64_t pa, uintptr_t* outVa, size_t size) noexcept
+	{
+		if (!outVa || !fm) return false;
+		*outVa = 0;
+		try { return fm(pa, outVa, size); }
+		catch (...) { return false; }
+	}
 
 	// Returns true iff callbacks are usable.
 	bool CallbacksValid() const { return static_cast<bool>(fn_pa_map_) && static_cast<bool>(fn_pa_unmap_); }
 
-	// Derives the OS paging mode from the cached kernel image base. Paging
-	// mode is a property of the whole OS address space, so the image base the
-	// OS itself placed is the authoritative runtime signal (CPUID(7,0):ECX[16]
-	// only reports CPU capability, not the active mode — see the VaToPa
-	// comment). 4-level canonical kernel half has bits[63:47] == 0x1FFFF
-	// (sign-extended from bit 47); a kernel base outside that is taken to mean
-	// 5-level paging. When kernelbase_ is not yet cached we default to 4-level.
-	bool Is4LevelPaging() const noexcept
+	// Shared 4-level/5-level canonical addresses do not identify the active
+	// mode. Only an address exclusive to LA57 proves 5-level paging.
+	mmio_model::PagingMode DetectPagingMode() const noexcept
 	{
-		return (kernelbase_ != 0) ? ((kernelbase_ >> 47) == 0x1FFFFull) : true;
+		if (kernelbase_ && mmio_model::IsCanonical(kernelbase_, 57) &&
+		    !mmio_model::IsCanonical(kernelbase_, 48))
+			return mmio_model::PagingMode::FiveLevel;
+		return mmio_model::PagingMode::Unknown;
 	}
 
 	// SEH / exception-safe helpers. SehCopy is the single __try/__except leaf
@@ -231,7 +296,8 @@ private:
 	// memory read to SehCopy. Defined out-of-line below.
 	static bool SehCopy(void* dst, const void* src, size_t n);
 	static bool SehReadPte(uint64_t ptePa, uint64_t* out,
-	                       const FnMap& fm, const FnUnMap& fu);
+	                       const FnMap& fm, const FnUnMap& fu,
+	                       MmioStatus* failureStatus = nullptr);
 	static bool SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfanew,
 	                         const FnMap& fm, const FnUnMap& fu);
 	static bool SehReadHighHalfEntry(const uint8_t* tableBase, size_t entryOff, uint64_t* out);
@@ -243,10 +309,13 @@ private:
 
 	// reserved for direct IOCTL usage by consumers / subclasses
 	HANDLE   hDevice_      = INVALID_HANDLE_VALUE;
+	bool     ownsDeviceHandle_ = true;
 	uint64_t kernelbase_   = 0;
 	uint64_t system_cr3pa_ = 0;
+	mmio_model::PagingMode paging_mode_ = mmio_model::PagingMode::Unknown;
 	FnMap    fn_pa_map_;
 	FnUnMap  fn_pa_unmap_;
+	FnGetPhysicalRanges fn_get_physical_ranges_;
 	// diagnostics: set on Initialize()/Read*/Write* failure paths.
 	mutable MmioStatus last_status_ = MmioStatus::Ok;
 	mutable DWORD      last_error_  = 0;
@@ -278,15 +347,28 @@ inline bool Mmio::SehCopy(void* dst, const void* src, size_t n)
 // owned by a ScopedMap guard (exception-safe); the read itself goes through
 // the SehCopy leaf so an access violation is reported, never propagated.
 inline bool Mmio::SehReadPte(uint64_t ptePa, uint64_t* out,
-                             const FnMap& fm, const FnUnMap& fu)
+                             const FnMap& fm, const FnUnMap& fu,
+                             MmioStatus* failureStatus)
 {
 	uintptr_t mapped = 0;
-	if (!fm(ptePa & ~0xFFFull, &mapped, 0x1000))
+	if (!TryMap(fm, ptePa & ~0xFFFull, &mapped, 0x1000)) {
+		if (failureStatus) *failureStatus = MmioStatus::MappingFailed;
 		return false;
+	}
 
 	ScopedMap guard{ &fu, mapped, true };
-	return SehCopy(out, reinterpret_cast<const void*>(mapped + (ptePa & 0xFFFull)),
-	               sizeof(uint64_t));
+	const uintptr_t offset = static_cast<uintptr_t>(ptePa & 0xFFFull);
+	if (mapped == 0 || mapped > UINTPTR_MAX - 0x1000u ||
+	    mapped > UINTPTR_MAX - offset - sizeof(uint64_t)) {
+		if (failureStatus) *failureStatus = MmioStatus::InvalidArgument;
+		return false;
+	}
+	if (!SehCopy(out, reinterpret_cast<const void*>(mapped + offset), sizeof(uint64_t))) {
+		if (failureStatus) *failureStatus = MmioStatus::InternalError;
+		return false;
+	}
+	if (failureStatus) *failureStatus = MmioStatus::Ok;
+	return true;
 }
 
 // Reads the MZ magic and e_lfanew from the first page of a kernel image.
@@ -302,10 +384,12 @@ inline bool Mmio::SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfa
 	// still reports any fault as a failure. `pa` is page-aligned in practice
 	// (the kernel image base), but this keeps the helper safe for any input.
 	uintptr_t mapped = 0;
-	if (!fm(pa & ~0xFFFull, &mapped, 0x2000))
-		return false;
+	if (!TryMap(fm, pa & ~0xFFFull, &mapped, 0x2000)) return false;
 
 	ScopedMap guard{ &fu, mapped, true };
+	const uintptr_t offset = static_cast<uintptr_t>(pa & 0xFFFull);
+	if (mapped == 0 || mapped > UINTPTR_MAX - 0x2000u ||
+	    mapped > UINTPTR_MAX - offset - 0x40u) return false;
 	const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped + (pa & 0xFFFull));
 	if (!SehCopy(outMagic, base, sizeof(uint16_t)))
 		return false;
@@ -315,11 +399,13 @@ inline bool Mmio::SehReadMagic(uint64_t pa, uint16_t* outMagic, uint32_t* outLfa
 
 // Reads one 8-byte entry of the candidate top-level paging table (PML4 under
 // 4-level paging, PML5 under 5-level paging). `tableBase` is already mapped by
-// the caller; `entryOff` is the byte offset of the high-half entry to check
-// (PML4[511] => 0x1FF*8 under 4-level; PML5[1] => 1*8 under 5-level). Pure
-// read helper — the SEH leaf reports any fault as a failure.
+// the caller; `entryOff` is derived from the candidate kernel VA's top-level
+// index. Pure read helper — the SEH leaf reports any fault as a failure.
 inline bool Mmio::SehReadHighHalfEntry(const uint8_t* tableBase, size_t entryOff, uint64_t* out)
 {
+	const uintptr_t base = reinterpret_cast<uintptr_t>(tableBase);
+	if (!tableBase || !out || entryOff > 0xFF8u || base > UINTPTR_MAX - entryOff - sizeof(uint64_t))
+		return false;
 	return SehCopy(out, tableBase + entryOff, sizeof(uint64_t));
 }
 
@@ -363,8 +449,21 @@ inline uint64_t Mmio::PaddrMask()
 	return mask;
 }
 
+inline unsigned Mmio::PaddrBits()
+{
+	const uint64_t mask = PaddrMask();
+	unsigned bits = 12;
+	while (bits < 52 && (mask & (1ull << bits)) != 0) ++bits;
+	return bits;
+}
+
 inline bool Mmio::Initialize()
 {
+	// Initialization is transactional: callers never observe stale cached
+	// addresses from a previous attempt after a later attempt fails.
+	kernelbase_   = 0;
+	system_cr3pa_ = 0;
+	paging_mode_  = mmio_model::PagingMode::Unknown;
 	last_status_ = MmioStatus::Ok;
 	last_error_  = 0;
 
@@ -380,13 +479,18 @@ inline bool Mmio::Initialize()
 
 	kernelbase_ = GetKernelBase();
 	if (!kernelbase_) {
-		last_status_ = MmioStatus::NoKernelBase;
+		if (last_error_ == ERROR_PRIVILEGE_NOT_HELD)
+			last_status_ = MmioStatus::NoSeDebugPrivilege;
+		else if (last_error_ == ERROR_ACCESS_DENIED)
+			last_status_ = MmioStatus::AccessDenied;
+		else
+			last_status_ = MmioStatus::NoKernelBase;
 		return false;
 	}
 
 	system_cr3pa_ = FindSystemCr3();
 	if (!system_cr3pa_) {
-		last_status_ = MmioStatus::NoSystemCr3;
+		if (last_status_ == MmioStatus::Ok) last_status_ = MmioStatus::NoSystemCr3;
 		return false;
 	}
 
@@ -399,19 +503,21 @@ inline bool Mmio::ReadPhysicalMemory(uint64_t pa, void* buf, size_t size)
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
 
+	if (size == 0 || buf == nullptr || size > UINT64_MAX - pa) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (size == 0)                return true;   // nothing to do
-	if (buf == nullptr)           { last_status_ = MmioStatus::InternalError; return false; }
 	// Bound `size` on its own before forming pageOffset + size. A caller
 	// passing size ≈ SIZE_MAX would otherwise wrap requiredSize to a small
 	// value and bypass the 0x2000 limit below; the SEH leaf would still catch
 	// the fault, but the documented "single mapping window covers the range"
 	// invariant (pageOffset + size ≤ 0x2000) must hold arithmetically, not via
 	// fault tolerance.
-	if (size > 0x2000)            { last_status_ = MmioStatus::InternalError; return false; }
+	if (size > 0x2000)            { last_status_ = MmioStatus::InvalidArgument; return false; }
 
 	const uintptr_t pageOffset   = static_cast<uintptr_t>(pa & 0xFFFull);
 	const size_t    requiredSize = pageOffset + size;   // size ≤ 0x2000 ⇒ no wrap
@@ -419,19 +525,23 @@ inline bool Mmio::ReadPhysicalMemory(uint64_t pa, void* buf, size_t size)
 	// pageOffset + size must not exceed 0x2000. Larger or multi-page requests
 	// must be segmented by the caller (e.g. ReadKernelMemory).
 	if (requiredSize > 0x2000) {
-		last_status_ = MmioStatus::InternalError;
+		last_status_ = MmioStatus::InvalidArgument;
 		return false;
 	}
 	const size_t mapSize = (requiredSize > 0x1000) ? 0x2000 : 0x1000;
 	const uint64_t alignedPa = pa & ~0xFFFull;
 
 	uintptr_t mapped = 0;
-	if (!fn_pa_map_(alignedPa, &mapped, mapSize)) {
+	if (!TryMap(fn_pa_map_, alignedPa, &mapped, mapSize)) {
 		last_status_ = MmioStatus::MappingFailed;
 		return false;
 	}
 
 	ScopedMap guard{ &fn_pa_unmap_, mapped, true };
+	if (mapped == 0 || mapped > UINTPTR_MAX - mapSize) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 
 	const bool ok = SehCopy(buf, reinterpret_cast<void*>(mapped + pageOffset), size);
 	if (!ok)
@@ -444,34 +554,40 @@ inline bool Mmio::WritePhysicalMemory(uint64_t pa, const void* buf, size_t size)
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
 
+	if (size == 0 || buf == nullptr || size > UINT64_MAX - pa) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (size == 0)                return true;
-	if (buf == nullptr)           { last_status_ = MmioStatus::InternalError; return false; }
 	// Bound size on its own first (see ReadPhysicalMemory for the full
 	// rationale): a near-SIZE_MAX request must not wrap requiredSize past the
 	// 0x2000 limit — the single-window invariant holds arithmetically, not
 	// only via the SEH leaf's fault tolerance.
-	if (size > 0x2000)            { last_status_ = MmioStatus::InternalError; return false; }
+	if (size > 0x2000)            { last_status_ = MmioStatus::InvalidArgument; return false; }
 
 	const uintptr_t pageOffset   = static_cast<uintptr_t>(pa & 0xFFFull);
 	const size_t    requiredSize = pageOffset + size;   // size ≤ 0x2000 ⇒ no wrap
 	if (requiredSize > 0x2000) {
-		last_status_ = MmioStatus::InternalError;
+		last_status_ = MmioStatus::InvalidArgument;
 		return false;
 	}
 	const size_t mapSize = (requiredSize > 0x1000) ? 0x2000 : 0x1000;
 	const uint64_t alignedPa = pa & ~0xFFFull;
 
 	uintptr_t mapped = 0;
-	if (!fn_pa_map_(alignedPa, &mapped, mapSize)) {
+	if (!TryMap(fn_pa_map_, alignedPa, &mapped, mapSize)) {
 		last_status_ = MmioStatus::MappingFailed;
 		return false;
 	}
 
 	ScopedMap guard{ &fn_pa_unmap_, mapped, true };
+	if (mapped == 0 || mapped > UINTPTR_MAX - mapSize) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 
 	const bool ok = SehCopy(reinterpret_cast<void*>(mapped + pageOffset), buf, size);
 	if (!ok)
@@ -481,15 +597,41 @@ inline bool Mmio::WritePhysicalMemory(uint64_t pa, const void* buf, size_t size)
 
 inline bool Mmio::ReadKernelMemory(uint64_t va, void* buf, size_t size)
 {
+	return ReadKernelMemoryImpl(va, buf, size, nullptr);
+}
+
+inline IoResult Mmio::ReadKernelMemoryDetailed(uint64_t va, void* buf, size_t size)
+{
+	size_t completed = 0;
+	const bool ok = ReadKernelMemoryImpl(va, buf, size, &completed);
+	return {ok ? MmioStatus::Ok : last_status_, completed, last_error_};
+}
+
+inline IoResult Mmio::ReadKernelMemoryDetailed(uint64_t va, void* buf, size_t size,
+                                               uint64_t cr3pa, mmio_model::PagingMode mode)
+{
+	size_t completed = 0;
+	const bool ok = ReadKernelMemoryImpl(va, buf, size, &completed, cr3pa, mode);
+	return {ok ? MmioStatus::Ok : last_status_, completed, last_error_};
+}
+
+inline bool Mmio::ReadKernelMemoryImpl(uint64_t va, void* buf, size_t size, size_t* completed,
+                                       uint64_t cr3pa, mmio_model::PagingMode mode)
+{
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
+	if (completed) *completed = 0;
 
+	if (size == 0 || size > UINT64_MAX - va || buf == nullptr) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (buf == nullptr && size > 0) {
-		last_status_ = MmioStatus::InternalError;
+	if (!cr3pa && !system_cr3pa_) {
+		last_status_ = MmioStatus::NotInitialized;
 		return false;
 	}
 
@@ -501,28 +643,56 @@ inline bool Mmio::ReadKernelMemory(uint64_t va, void* buf, size_t size)
 		const size_t inPage = 0x1000 - static_cast<size_t>(cur & 0xFFFull);
 		const size_t seg    = (remaining < inPage) ? remaining : inPage;
 
-		const uint64_t pa = VaToPa(cur);
+		const uint64_t pa = (mode == mmio_model::PagingMode::Unknown)
+			? VaToPa(cur, cr3pa) : VaToPaWithMode(cur, cr3pa, mode);
 		if (!pa) return false;   // VaToPa() already set last_status_ = TranslationFailed
 		if (!ReadPhysicalMemory(pa, out, seg)) return false;  // status already set
 
 		out       += seg;
 		cur       += seg;
 		remaining -= seg;
+		if (completed) *completed += seg;
 	}
 	return true;
 }
 
 inline bool Mmio::WriteKernelMemory(uint64_t va, const void* buf, size_t size)
 {
+	return WriteKernelMemoryImpl(va, buf, size, nullptr);
+}
+
+inline IoResult Mmio::WriteKernelMemoryDetailed(uint64_t va, const void* buf, size_t size)
+{
+	size_t completed = 0;
+	const bool ok = WriteKernelMemoryImpl(va, buf, size, &completed);
+	return {ok ? MmioStatus::Ok : last_status_, completed, last_error_};
+}
+
+inline IoResult Mmio::WriteKernelMemoryDetailed(uint64_t va, const void* buf, size_t size,
+                                                uint64_t cr3pa, mmio_model::PagingMode mode)
+{
+	size_t completed = 0;
+	const bool ok = WriteKernelMemoryImpl(va, buf, size, &completed, cr3pa, mode);
+	return {ok ? MmioStatus::Ok : last_status_, completed, last_error_};
+}
+
+inline bool Mmio::WriteKernelMemoryImpl(uint64_t va, const void* buf, size_t size, size_t* completed,
+                                        uint64_t cr3pa, mmio_model::PagingMode mode)
+{
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
+	if (completed) *completed = 0;
 
+	if (size == 0 || size > UINT64_MAX - va || buf == nullptr) {
+		last_status_ = MmioStatus::InvalidArgument;
+		return false;
+	}
 	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return false;
 	}
-	if (buf == nullptr && size > 0) {
-		last_status_ = MmioStatus::InternalError;
+	if (!cr3pa && !system_cr3pa_) {
+		last_status_ = MmioStatus::NotInitialized;
 		return false;
 	}
 
@@ -534,118 +704,66 @@ inline bool Mmio::WriteKernelMemory(uint64_t va, const void* buf, size_t size)
 		const size_t inPage = 0x1000 - static_cast<size_t>(cur & 0xFFFull);
 		const size_t seg    = (remaining < inPage) ? remaining : inPage;
 
-		const uint64_t pa = VaToPa(cur);
+		const uint64_t pa = (mode == mmio_model::PagingMode::Unknown)
+			? VaToPa(cur, cr3pa) : VaToPaWithMode(cur, cr3pa, mode);
 		if (!pa) return false;   // VaToPa() already set last_status_ = TranslationFailed
 		if (!WritePhysicalMemory(pa, in, seg)) return false;  // status already set
 
 		in        += seg;
 		cur       += seg;
 		remaining -= seg;
+		if (completed) *completed += seg;
 	}
 	return true;
 }
 
 inline uint64_t Mmio::VaToPa(uint64_t va, uint64_t cr3pa)
 {
+	const auto mode = paging_mode_ != mmio_model::PagingMode::Unknown
+		? paging_mode_ : DetectPagingMode();
+	return VaToPaWithMode(va, cr3pa, mode);
+}
+
+inline uint64_t Mmio::VaToPaWithMode(uint64_t va, uint64_t cr3pa,
+                                    mmio_model::PagingMode mode)
+{
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
-
-	if (!cr3pa)
-		cr3pa = system_cr3pa_;
-	if (!cr3pa) {                          // no CR3 available
-		last_status_ = MmioStatus::TranslationFailed;
+	if (!cr3pa) cr3pa = system_cr3pa_;
+	if (!cr3pa) {
+		last_status_ = MmioStatus::NotInitialized;
 		return 0;
 	}
-	if (!CallbacksValid()) {               // can't walk PTEs without the map callbacks
+	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return 0;
 	}
-
-	const uint64_t PADDR_MASK     = PaddrMask();
-	constexpr uint64_t PTE_PRESENT    = (1ull << 0);
-	constexpr uint64_t PTE_LARGE_PAGE = (1ull << 7);
-
-	// --- Paging mode detection ---------------------------------------------
-	// Decide whether the OS is actually using 5-level (LA57) paging for the
-	// current address space. CPUID(7,0):ECX[16] only reports CPU *capability*;
-	// many modern CPUs set it while Windows still runs 4-level paging, so using
-	// the capability bit directly breaks every such machine. We instead judge
-	// by the canonical form of the cached kernel image base — paging mode is
-	// a property of the OS address space, not of any individual VA, so the
-	// image base (which the OS itself placed) is the authoritative signal:
-	//   4-level canonical kernel half: bits[63:47] == 0x1FFFF (sign-extended bit 47)
-	//   5-level canonical kernel half: bits[63:57] == 0x7F with bit 56 set
-	//                                  (sign-extended bit 56); the 4-level
-	//                                  kernel half [0xFFFF_8000_..., 0xFFFF_FFFF_...]
-	//                                  is a *subset* of it, so a high-half VA
-	//                                  alone cannot distinguish the two.
-	// This is correct for:
-	//   * 4-level OS (kernelbase_ in the shared high half) — the Windows default;
-	//   * 5-level OS whose kernel image lives in the 5-level-exclusive region
-	//     [0xFF00_0000_0000_0000, 0xFFFF_7FFF_FFFF_FFFF], the natural LA57
-	//     kernel half.
-	// A 5-level OS that keeps its kernel image in the 4-level-compatible shared
-	// high half is not auto-detected. This matches every shipping Windows
-	// build today and avoids the false-positive risk of retrying the walk under
-	// the other mode on a 4-level OS (cr3pa points at a PML4 table, so a
-	// 5-level walk could silently produce a wrong PA instead of failing).
-	// When kernelbase_ is not yet cached we default to 4-level paging.
-	const bool    looks4Level = Is4LevelPaging();
-	const int     vaBits      = looks4Level ? 48 : 57;
-	const int     startIdx    = looks4Level ? 1 : 0;
-
-	const uint8_t shifts[] = { 48, 39, 30, 21, 12 };   // PML5→PML4→PDPT→PD→PT
-
-	// Canonical-address check
-	const uint64_t topBits = va >> (vaBits - 1);
-	const uint64_t topMask = (1ull << (64 - vaBits + 1)) - 1;
-	if (topBits != 0 && topBits != topMask) {
-		last_status_ = MmioStatus::TranslationFailed;
+	if (mode == mmio_model::PagingMode::Unknown) {
+		last_status_ = MmioStatus::UnsupportedPagingMode;
 		return 0;
 	}
 
-	// --- Page-table walk ---------------------------------------------------
-	uint64_t pagingBase = cr3pa & PADDR_MASK;
-	uint64_t pteValue   = 0;
-
-	for (int i = startIdx; i < 5; ++i) {
-		const uint64_t idx   = (va >> shifts[i]) & 0x1FFull;
-		const uint64_t ptePa = pagingBase + idx * sizeof(uint64_t);
-
-		// Use the SEH-protected leaf so a transient mapping fault does not
-		// tear down the whole walk.
-		if (!SehReadPte(ptePa, &pteValue, fn_pa_map_, fn_pa_unmap_)) {
+	MmioStatus readFailureStatus = MmioStatus::TranslationFailed;
+	const auto result = mmio_model::WalkPageTables(va, cr3pa, PaddrBits(), mode,
+		[this, &readFailureStatus](uint64_t ptePa, uint64_t& value) {
+			return SehReadPte(ptePa, &value, fn_pa_map_, fn_pa_unmap_, &readFailureStatus);
+		});
+	if (!result) {
+		if (result.error == mmio_model::WalkError::UnsupportedMode)
+			last_status_ = MmioStatus::UnsupportedPagingMode;
+		else if (result.error == mmio_model::WalkError::ReadFailure)
+			last_status_ = readFailureStatus;
+		else
 			last_status_ = MmioStatus::TranslationFailed;
-			return 0;
-		}
-		if (!(pteValue & PTE_PRESENT)) {
-			last_status_ = MmioStatus::TranslationFailed;
-			return 0;
-		}
-
-		// Large-page (PS bit set) can only designate a leaf at PDPT (1 GB) or
-		// PD (2 MB). PML4's PS bit is reserved and must be treated as a
-		// regular page-directory pointer (continue the walk).
-		if (pteValue & PTE_LARGE_PAGE) {
-			if (i == 2) {
-				// 1 GB page (PDPT entry, PS=1)
-				const uint64_t pageMask = PADDR_MASK & ~((1ull << 30) - 1);
-				return (pteValue & pageMask) | (va & 0x3FFFFFFFull);
-			}
-			if (i == 3) {
-				// 2 MB page (PD entry, PS=1)
-				const uint64_t pageMask = PADDR_MASK & ~((1ull << 21) - 1);
-				return (pteValue & pageMask) | (va & 0x1FFFFFull);
-			}
-			// PS set at PML5 (i==0) or PML4 (i==1) is reserved -> ignore and
-			// continue the walk down to the next level.
-		}
-
-		pagingBase = pteValue & PADDR_MASK;
+		return 0;
 	}
-
-	// i == 4 reached: pteValue is a PT entry (4 KB leaf).
-	return (pteValue & PADDR_MASK) | (va & 0xFFFull);
+	if (result.physical_address == 0) {
+		// The legacy API uses zero as its failure sentinel, so a valid mapping
+		// of physical page zero cannot be represented to callers.
+		last_status_ = MmioStatus::TranslationFailed;
+		return 0;
+	}
+	return result.physical_address;
 }
 
 // Best-effort enablement of SeDebugPrivilege. Required by EnumDeviceDrivers
@@ -694,7 +812,10 @@ inline uint64_t Mmio::GetKernelBase()
 		// else: cbNeeded holds the required size (the expected, normal path).
 	}
 	if (cbNeeded == 0)
+	{
+		last_error_ = ERROR_NOT_FOUND;
 		return 0;
+	}
 
 	// The driver set can change between the size query and the data call; only
 	// THAT failure is worth retrying (re-querying the size each retry).
@@ -712,8 +833,10 @@ inline uint64_t Mmio::GetKernelBase()
 			}
 			return 0;
 		}
-		if (cbNeeded2 == 0 || drivers.empty())
+		if (cbNeeded2 == 0 || drivers.empty()) {
+			last_error_ = ERROR_NOT_FOUND;
 			return 0;
+		}
 
 		// On Windows 11 24H2+, EnumDeviceDrivers returns TRUE but fills
 		// the array with NULLs when SeDebugPrivilege is missing.
@@ -740,8 +863,10 @@ inline uint64_t Mmio::GetKernelBase()
 			if (!drvBase) continue;
 			if (GetDeviceDriverBaseNameW(drvBase, nameBuf, 64) == 0) continue;
 			for (const wchar_t* k : kKernelNames) {
-				if (lstrcmpiW(nameBuf, k) == 0)
+				if (lstrcmpiW(nameBuf, k) == 0) {
+					last_error_ = 0;
 					return reinterpret_cast<uint64_t>(drvBase);
+				}
 			}
 		}
 
@@ -750,6 +875,7 @@ inline uint64_t Mmio::GetKernelBase()
 		// renamed/new kernel image name we did not list still resolves on
 		// current systems; the PE-signature check in FindSystemCr3 still rejects
 		// a non-kernel base during CR3 validation.
+		last_error_ = 0;
 		return reinterpret_cast<uint64_t>(drivers[0]);
 	}
 	return 0;
@@ -759,7 +885,6 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 {
 	last_error_  = 0;
 	last_status_ = MmioStatus::Ok;
-
 	if (!CallbacksValid()) {
 		last_status_ = MmioStatus::BadCallbacks;
 		return 0;
@@ -769,126 +894,156 @@ inline uint64_t Mmio::FindSystemCr3(FnProgress progress)
 		return 0;
 	}
 
-	// Query the actual amount of installed physical memory.
-	ULONGLONG totalMemoryKiB = 0;
-	uint64_t  maxPa = 0;
-	if (GetPhysicallyInstalledSystemMemory(&totalMemoryKiB) && totalMemoryKiB > 0)
-		maxPa = totalMemoryKiB * 1024;            // KiB → bytes
-	else
-		maxPa = 0x2000000000ull;                  // fallback: 128 GB
-
-	// Scan in 2 MB windows. If a 2 MB mapping is rejected by the callback we
-	// fall back to 4 KB granularity for that region instead of skipping it.
-	constexpr uint64_t chunkSize = 0x200000;       // 2 MB
-	constexpr uint64_t pageSize  = 0x1000;         // 4 KB
-
-	// Start from the first physical page (0x0). Physical page 0 is usually
-	// reserved by firmware, but a CR3 table could theoretically reside there.
-	for (uint64_t pa = 0x0; pa < maxPa; pa += chunkSize) {
-		if (progress && !progress(pa)) {
-			last_status_ = MmioStatus::Cancelled;   // scan aborted by the caller
+	std::vector<PhysicalRange> ranges;
+	if (fn_get_physical_ranges_) {
+		try {
+			if (!fn_get_physical_ranges_(ranges)) {
+				last_status_ = MmioStatus::PhysicalRangesUnavailable;
+				return 0;
+			}
+		} catch (...) {
+			last_status_ = MmioStatus::InternalError;
 			return 0;
 		}
-
-		uintptr_t chunkVa = 0;
-		const uint8_t* chunkBuf = nullptr;
-		bool chunkMapped = false;
-		if (fn_pa_map_(pa, &chunkVa, chunkSize)) {
-			chunkBuf    = reinterpret_cast<const uint8_t*>(chunkVa);
-			chunkMapped = true;
+	} else {
+		// Backward-compatible estimate. Installed capacity is not a physical
+		// address ceiling; callers with memory holes/remapping should provide
+		// FnGetPhysicalRanges to enumerate the actual ranges.
+		ULONGLONG totalMemoryKiB = 0;
+		uint64_t estimatedSpan = 0x2000000000ull; // 128 GB fallback
+		if (GetPhysicallyInstalledSystemMemory(&totalMemoryKiB) && totalMemoryKiB > 0) {
+			estimatedSpan = totalMemoryKiB <= UINT64_MAX / 1024
+				? totalMemoryKiB * 1024 : 0x2000000000ull;
 		}
-		// RAII guard for the 2 MB chunk mapping. The previous implementation
-		// released the chunk with a manual call only AFTER the inner loop; if a
-		// callback threw inside VaToPa()/SehReadPte() during the loop, stack
-		// unwinding skipped that unmap and leaked the 2 MB mapping. ScopedMap
-		// guarantees release on every exit (break / return / exception),
-		// matching the README's stated exception-safety guarantee.
-		ScopedMap chunkGuard{ &fn_pa_unmap_, chunkVa, chunkMapped };
+		estimatedSpan &= ~uint64_t{0xFFF};
+		if (estimatedSpan) ranges.push_back({0, estimatedSpan});
+	}
 
-		bool     found     = false;
-		uint64_t resultCr3 = 0;
-
-		for (uint64_t offset = 0; offset < chunkSize; offset += pageSize) {
-			const uint64_t cr3Candidate = pa + offset;
-			const uint8_t* pageBase = nullptr;
-
-			// Prefer the bulk 2 MB mapping; otherwise map this single 4 KB
-			// page directly so drivers that only support page-granularity
-			// mappings can still locate the CR3.
-			uintptr_t pageVa = 0;
-			bool      pageMapped = false;
-			if (chunkMapped) {
-				pageBase = chunkBuf + offset;
-			} else {
-				if (!fn_pa_map_(cr3Candidate, &pageVa, pageSize))
-					continue;
-				pageBase   = reinterpret_cast<const uint8_t*>(pageVa);
-				pageMapped = true;
-			}
-
-			// Scoped RAII guard for the optional per-page mapping. Uses the
-			// shared ScopedMap (the former local PgGuard, now deduplicated) so
-			// a thrown callback or any early exit still releases the mapping.
-			ScopedMap pg{ &fn_pa_unmap_, pageVa, pageMapped };
-
-			// The high-half entry of the candidate top-level table must be present.
-			// Under 4-level paging that is PML4[511] (offset 0xFF8); under 5-level
-			// paging the kernel half is covered by PML5[1] (offset 0x8), and a
-			// kernel base in the 5-level-exclusive region may have PML4[511].P == 0
-			// — so checking PML4[511] unconditionally (as the previous code did)
-			// would discard the real System CR3 on a 5-level OS. The mode is derived
-			// from the cached kernel base via Is4LevelPaging().
-			const bool   cr3Looks4Level = Is4LevelPaging();
-			const size_t hiEntryOff     = cr3Looks4Level ? (0x1FF * 8) : (1 * 8);
-			uint64_t     hiEntry        = 0;
-			if (!SehReadHighHalfEntry(pageBase, hiEntryOff, &hiEntry))
-				continue;
-			if (!(hiEntry & 1))
-				continue;
-
-			// Translate the kernel base through this candidate CR3.
-			const uint64_t kernelPa = VaToPa(kernelbase_, cr3Candidate);
-			if (!kernelPa)
-				continue;
-
-			// Map the kernel's PE header and verify "MZ" plus e_lfanew/PE sig.
-			uint16_t magic = 0;
-			uint32_t lfanew = 0;
-			if (!SehReadMagic(kernelPa, &magic, &lfanew, fn_pa_map_, fn_pa_unmap_))
-				continue;
-			if (magic != 0x5A4D)           // "MZ"
-				continue;
-
-			// Secondary validation: the NT image headers must carry "PE\0\0".
-			// e_lfanew is the offset of the PE header from the image base.
-			// 0x400 is an empirical upper bound for an ntoskrnl DOS stub, not a
-			// PE-spec-mandated limit; the PE-signature check below is what
-			// actually rejects mismatches -- this bound only filters obviously
-			// bogus offsets cheaply.
-			if (lfanew == 0 || lfanew > 0x400)
-				continue;
-
-			const uint64_t peHdrPa = VaToPa(kernelbase_ + lfanew, cr3Candidate);
-			if (!peHdrPa)
-				continue;
-
-			uint32_t peSig = 0;
-			if (!ReadPhysicalMemory(peHdrPa, &peSig, sizeof(peSig)))
-				continue;
-			if (peSig != 0x00004550)       // "PE\0\0"
-				continue;
-
-			resultCr3 = cr3Candidate;
-			found     = true;
-			break;
-		}
-
-		if (found) {
-			last_status_ = MmioStatus::Ok;   // a sub-call may have left a stale status
-			return resultCr3;   // chunkGuard unmaps the 2 MB chunk on return/unwind
+	const auto rangeError = mmio_model::NormalizePhysicalRanges(ranges);
+	if (rangeError == mmio_model::RangeError::Empty) {
+		last_status_ = MmioStatus::PhysicalRangesUnavailable;
+		return 0;
+	}
+	if (rangeError != mmio_model::RangeError::None) {
+		last_status_ = MmioStatus::InvalidPhysicalRange;
+		return 0;
+	}
+	for (const auto& range : ranges) {
+		if (!mmio_model::IsPhysicalRangeSupported(range.base, range.length, PaddrBits())) {
+			last_status_ = MmioStatus::InvalidPhysicalRange;
+			return 0;
 		}
 	}
 
-	last_status_ = MmioStatus::NoSystemCr3;   // scan exhausted without a match
+	constexpr uint64_t chunkSize = 0x200000; // 2 MB
+	constexpr uint64_t pageSize  = 0x1000;   // 4 KB
+	bool sawAmbiguousMode = false;
+	bool anyMapping = false;
+	bool sawNullMapping = false;
+	bool sawInvalidMapAddress = false;
+
+	for (const auto& range : ranges) {
+		const uint64_t rangeEnd = range.base + range.length;
+		for (uint64_t pa = range.base; pa < rangeEnd; ) {
+			const uint64_t windowSize = (rangeEnd - pa < chunkSize) ? (rangeEnd - pa) : chunkSize;
+			if (progress) {
+				try {
+					if (!progress(pa)) {
+						last_status_ = MmioStatus::Cancelled;
+						return 0;
+					}
+				} catch (...) {
+					last_status_ = MmioStatus::InternalError;
+					return 0;
+				}
+			}
+
+			uintptr_t chunkVa = 0;
+			const uint8_t* chunkBuf = nullptr;
+			bool chunkMapped = TryMap(fn_pa_map_, pa, &chunkVa, static_cast<size_t>(windowSize));
+			if (chunkMapped) anyMapping = true;
+			ScopedMap chunkGuard{ &fn_pa_unmap_, chunkVa, chunkMapped };
+			if (chunkMapped && chunkVa != 0 && chunkVa <= UINTPTR_MAX - windowSize) {
+				chunkBuf = reinterpret_cast<const uint8_t*>(chunkVa);
+			} else {
+				if (chunkMapped && chunkVa == 0) sawNullMapping = true;
+				else if (chunkMapped) sawInvalidMapAddress = true;
+				chunkMapped = false;
+			}
+
+			bool found = false;
+			uint64_t resultCr3 = 0;
+			mmio_model::PagingMode resultMode = mmio_model::PagingMode::Unknown;
+			for (uint64_t offset = 0; offset < windowSize; offset += pageSize) {
+				const uint64_t cr3Candidate = pa + offset;
+				const uint8_t* pageBase = nullptr;
+				uintptr_t pageVa = 0;
+				bool pageMapped = false;
+				if (chunkMapped) {
+					pageBase = chunkBuf + static_cast<size_t>(offset);
+				} else {
+					pageMapped = TryMap(fn_pa_map_, cr3Candidate, &pageVa, pageSize);
+					if (!pageMapped) continue;
+					anyMapping = true;
+					if (pageVa == 0) sawNullMapping = true;
+					else if (pageVa > UINTPTR_MAX - pageSize) sawInvalidMapAddress = true;
+					else pageBase = reinterpret_cast<const uint8_t*>(pageVa);
+				}
+				ScopedMap pageGuard{ &fn_pa_unmap_, pageVa, pageMapped };
+				if (!pageBase) { sawNullMapping = true; continue; }
+
+				auto validateForMode = [&](mmio_model::PagingMode mode) -> bool {
+					const size_t topEntryOffset =
+						static_cast<size_t>(mmio_model::TopLevelIndex(kernelbase_, mode)) * 8;
+					uint64_t topEntry = 0;
+					if (!SehReadHighHalfEntry(pageBase, topEntryOffset, &topEntry) || !(topEntry & 1))
+						return false;
+
+					const uint64_t kernelPa = VaToPaWithMode(kernelbase_, cr3Candidate, mode);
+					if (!kernelPa) return false;
+					uint16_t magic = 0;
+					uint32_t lfanew = 0;
+					if (!SehReadMagic(kernelPa, &magic, &lfanew, fn_pa_map_, fn_pa_unmap_) ||
+					    magic != 0x5A4D || lfanew == 0 || lfanew > 0x400)
+						return false;
+					if (!mmio_model::IsValidRange(kernelbase_, static_cast<uint64_t>(lfanew) + sizeof(uint32_t)))
+						return false;
+
+					const uint64_t peHeaderPa = VaToPaWithMode(kernelbase_ + lfanew, cr3Candidate, mode);
+					if (!peHeaderPa) return false;
+					uint32_t peSignature = 0;
+					return ReadPhysicalMemory(peHeaderPa, &peSignature, sizeof(peSignature)) &&
+					       peSignature == 0x00004550;
+				};
+
+				const bool valid4 = validateForMode(mmio_model::PagingMode::FourLevel);
+				const bool valid5 = validateForMode(mmio_model::PagingMode::FiveLevel);
+				if (valid4 && valid5) {
+					sawAmbiguousMode = true;
+					continue;
+				}
+				if (!valid4 && !valid5) continue;
+				resultCr3 = cr3Candidate;
+				resultMode = valid4 ? mmio_model::PagingMode::FourLevel
+				                    : mmio_model::PagingMode::FiveLevel;
+				found = true;
+				break;
+			}
+
+			if (found) {
+				system_cr3pa_ = resultCr3;
+				paging_mode_ = resultMode;
+				last_status_ = MmioStatus::Ok;
+				return resultCr3;
+			}
+			if (rangeEnd - pa <= chunkSize) break;
+			pa += chunkSize;
+		}
+	}
+
+	if (sawAmbiguousMode) last_status_ = MmioStatus::UnsupportedPagingMode;
+	else if (sawNullMapping || sawInvalidMapAddress) last_status_ = MmioStatus::InvalidArgument;
+	else if (!anyMapping) last_status_ = MmioStatus::MappingFailed;
+	else last_status_ = MmioStatus::NoSystemCr3;
 	return 0;
 }

@@ -1,0 +1,22 @@
+name: Windows tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Debug, Release]
+        cxx_standard: [20, 23]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Configure
+        run: cmake -S . -B build -A x64 -DMMIO_BUILD_TESTS=ON -DCMAKE_CXX_STANDARD=${{ matrix.cxx_standard }} -DCMAKE_CXX_STANDARD_REQUIRED=ON
+      - name: Build
+        run: cmake --build build --config ${{ matrix.configuration }} --parallel
+      - name: Run driver-free tests
+        run: ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure

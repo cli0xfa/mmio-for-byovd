@@ -25,8 +25,8 @@ bin/
 *.exe
 *.dll
 *.sys
-# keep the embedded test driver payload tracked:
-!test/WinIo.sys
+# keep the opt-in integration driver payload tracked:
+!integration/winio/WinIo.sys
 *.pdb
 *.ilk
 *.exp

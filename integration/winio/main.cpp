@@ -22,7 +22,7 @@
 #include <unordered_map>
 
 #include "resource.h"
-#include "../mmio-for-byovd/mmio.hpp"
+#include "../../mmio-for-byovd/mmio.hpp"
 
 // ---------------------------------------------------------------------------
 // WinIo on-the-wire structures (per WinIo_Reverse_Report.md)
@@ -68,6 +68,12 @@ static const char* StatusName(MmioStatus s)
 	case MmioStatus::NoSeDebugPrivilege:  return "NoSeDebugPrivilege";
 	case MmioStatus::Cancelled:           return "Cancelled";
 	case MmioStatus::InternalError:       return "InternalError";
+	case MmioStatus::InvalidArgument:     return "InvalidArgument";
+	case MmioStatus::NotInitialized:      return "NotInitialized";
+	case MmioStatus::UnsupportedPagingMode:return "UnsupportedPagingMode";
+	case MmioStatus::PhysicalRangesUnavailable:return "PhysicalRangesUnavailable";
+	case MmioStatus::InvalidPhysicalRange: return "InvalidPhysicalRange";
+	case MmioStatus::AccessDenied:         return "AccessDenied";
 	}
 	return "?";
 }
@@ -275,22 +281,52 @@ static void TestBadCallbacks()
 static void TestSizeBoundNoDriver()
 {
 	puts("[*] test: Read/WritePhysicalMemory size bound (no driver, no mem)");
+	int mapCalls = 0;
 	Mmio m(nullptr,
-		[](uint64_t, uintptr_t*, size_t) { return false; },  // always-fail map
+		[&mapCalls](uint64_t, uintptr_t*, size_t) { ++mapCalls; return false; },
 		[](uintptr_t) {});
 	uint8_t tmp[1] = {};
 
 	(void)m.ReadPhysicalMemory(0, tmp, 0x2001);
-	if (m.last_status() == MmioStatus::InternalError)
+	if (m.last_status() == MmioStatus::InvalidArgument)
 		Pass("ReadPhysicalMemory early-rejects size > 0x2000");
 	else
 		Fail("ReadPhysicalMemory early-rejects size > 0x2000");
 
 	(void)m.WritePhysicalMemory(0, tmp, 0x2001);
-	if (m.last_status() == MmioStatus::InternalError)
+	if (m.last_status() == MmioStatus::InvalidArgument)
 		Pass("WritePhysicalMemory early-rejects size > 0x2000");
 	else
 		Fail("WritePhysicalMemory early-rejects size > 0x2000");
+
+	(void)m.ReadPhysicalMemory(0, tmp, 0);
+	if (m.last_status() == MmioStatus::InvalidArgument && mapCalls == 0)
+		Pass("zero-length physical read rejected before mapping");
+	else
+		Fail("zero-length physical read rejected before mapping");
+
+	(void)m.ReadPhysicalMemory(UINT64_MAX, tmp, 1);
+	if (m.last_status() == MmioStatus::InvalidArgument && mapCalls == 0)
+		Pass("overflowing physical range rejected before mapping");
+	else
+		Fail("overflowing physical range rejected before mapping");
+
+	uint8_t kernelByte = 0;
+	(void)m.ReadKernelMemory(0xFFFF800000000000ull, &kernelByte, 1);
+	if (m.last_status() == MmioStatus::NotInitialized && mapCalls == 0)
+		Pass("kernel read requires successful initialization");
+	else
+		Fail("kernel read requires successful initialization");
+
+	int unmapCalls = 0;
+	Mmio nullMapping(nullptr,
+		[](uint64_t, uintptr_t* out, size_t) { *out = 0; return true; },
+		[&unmapCalls](uintptr_t) { ++unmapCalls; });
+	(void)nullMapping.ReadPhysicalMemory(0, tmp, 1);
+	if (nullMapping.last_status() == MmioStatus::InvalidArgument && unmapCalls == 1)
+		Pass("successful zero-address mapping is rejected and released");
+	else
+		Fail("successful zero-address mapping is rejected and released");
 }
 
 // Initialization: GetKernelBase + FindSystemCr3 both succeed → cached values.
@@ -491,7 +527,7 @@ int main()
 	if (!drv.Start()) {
 		const DWORD e = GetLastError();
 		printf("[!] StartService failed: %lu\n", e);
-		printf("    (if signature / blocklist: enable test-signing + disable HVCI)\n");
+		printf("    record the Windows error and policy state; keep security protections enabled.\n");
 		Skip("all driver tests", "driver load failed (blocked / unsigned on this machine)");
 		DeleteFileW(sysPath.c_str());
 		printf("\n== Summary: %d passed, %d failed, %d skipped ==\n", g_pass, g_fail, g_skip);
@@ -520,7 +556,7 @@ int main()
 	auto fnMap   = [&ctx](uint64_t pa, uintptr_t* outVa, size_t sz) { return WinIoMap(ctx, pa, outVa, sz); };
 	auto fnUnmap = [&ctx](uintptr_t va) { WinIoUnmap(ctx, va); };
 
-	Mmio mmio(hDev, fnMap, fnUnmap);
+	Mmio mmio(hDev, fnMap, fnUnmap, nullptr, /*ownsDeviceHandle=*/false);
 
 	if (mmio.Initialize()) {
 		printf("[+] Mmio::Initialize ok: kernel_base=0x%llx  System_CR3=0x%llx\n",

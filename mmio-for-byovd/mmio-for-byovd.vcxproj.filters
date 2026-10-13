@@ -18,5 +18,8 @@
     <ClInclude Include="mmio.hpp">
       <Filter>头文件</Filter>
     </ClInclude>
+    <ClInclude Include="mmio_paging_model.hpp">
+      <Filter>头文件</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
