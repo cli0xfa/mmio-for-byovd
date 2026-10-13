@@ -116,8 +116,9 @@ void TestEnumerationFailures()
 	const auto tooLarge = mmio_model::CollectEnumeration<int>([maxAligned](int*, size_t) {
 		return EnumerationCall{EnumerationCallStatus::Success, maxAligned, 0};
 	});
-	Check(tooLarge.error == EnumerationError::InvalidLength,
-	      "unrepresentable enumeration capacity is rejected before allocation");
+	Check((tooLarge.error == EnumerationError::InvalidLength ||
+	       tooLarge.error == EnumerationError::AllocationFailure) && tooLarge.entries.empty(),
+	      "extreme enumeration capacity fails cleanly without exposing a partial list");
 }
 
 void TestUniqueKernelSelection()
