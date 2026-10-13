@@ -1,4 +1,6 @@
-#include "../mmio-for-byovd/mmio_driver_enumeration_model.hpp"
+#define MMIO_MODEL_ONLY
+#include "../mmio-for-byovd/mmio.hpp"
+#undef MMIO_MODEL_ONLY
 
 #include <cstdlib>
 #include <iostream>

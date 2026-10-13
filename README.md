@@ -1,6 +1,6 @@
 # mmio-for-byovd
 
-一个 **header-only** 的物理内存映射辅助库（`mmio.hpp` 与两个平台无关的模型头文件）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、可用于内核映射的 CR3 定位」的通用封装。
+一个 **header-only** 的物理内存映射辅助库（单文件 `mmio.hpp`）。提供「把物理内存映射后端包装为内核 VA 读写、页表翻译、可用于内核映射的 CR3 定位」的通用封装。
 
 **一句话**：你提供 `FnMap`/`FnUnMap`（映射/取消映射物理页的回调），这个库帮你完成剩下的内核内存访问工作。
 
@@ -142,7 +142,7 @@ CR3 扫描只确认候选页表能映射内核映像，不识别它是否属于 
 
 ## 集成到你的工程
 
-1. 把 `mmio-for-byovd/` 加入 include 路径，并保留三个头文件的相对位置
+1. 把 `mmio-for-byovd/` 加入 include 路径，只需包含 `mmio.hpp`
 2. 链接 `psapi.lib`（已 `#pragma comment(lib, "psapi.lib")`，可用 `#define MMIO_NO_LIB_PRAGMA` 关闭）
 3. 工程需 C++20+ 且 `/EHsc`（已为 SEH 兼容性准备，详见代码注释）
 
