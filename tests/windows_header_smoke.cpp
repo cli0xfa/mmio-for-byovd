@@ -189,8 +189,7 @@ void TestDetailedPartialOperations()
     memory.Put(0x1000 + Index(va, 39) * 8, 0x2000 | 3);
     memory.Put(0x2000 + Index(va, 30) * 8, 0x3000 | 3);
     memory.Put(0x3000 + Index(va, 21) * 8, 0x4000 | 3);
-    memory.Put(0x4000 + Index(va, 12) * 8, 0x5000 | 3);
-    memory.Put(0x5000 + Index(va, 12) * 8, 0xA000 | 3);
+    memory.Put(0x4000 + Index(va, 12) * 8, 0xA000 | 3);
     uint8_t initial[16];
     for (size_t i = 0; i < sizeof(initial); ++i) initial[i] = static_cast<uint8_t>(0x20 + i);
     memory.PutBytes(0xAFF0, initial, sizeof(initial));
